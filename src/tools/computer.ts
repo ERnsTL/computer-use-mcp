@@ -250,15 +250,15 @@ Using the crosshair:
 Multi-step aiming (precision targeting):
 * On a large desktop (e.g. 1920x2160 dual-stacked, or 4K) the model only has limited "visual attention" to spend on a full screenshot, so a single direct click on a small button is unreliable.
 * Default workflow for precise clicking (and to avoid re-sending the whole desktop multiple times):
-  1. action=get_screenshot — identify the rough region of the target element.
-  2. action=get_focused_screenshot coordinate=[X, Y] size=400 (or 600, or [w, h]) — receive a small crop of the screen around (X, Y), plus metadata describing the crop's position in the full screen.
+  1. action=get_screenshot — identify the rough region of the target element. The response includes cursor_x / cursor_y so you know where the cursor is without re-reading the image.
+  2. action=get_focused_screenshot coordinate=[X, Y] size=400 (or 600, or [w, h]) — receive a small crop of the screen around (X, Y), plus metadata describing the crop's position in the full screen. The response also includes cursor_x / cursor_y (in full-screen API-image space) so you know the cursor location relative to the crop without another screenshot.
   3. In the crop, locate the exact target. Compute the click coordinates for the full screen:
      full_x = crop_x_min + local_x_in_crop * (crop_width / image_width)
      full_y = crop_y_min + local_y_in_crop * (crop_height / image_height)
      (For typical 400x400 or 600x600 crops, the returned image equals the crop in API-image space, so this simplifies to: full = crop_min + local.)
   4. Optionally use the separate "move_mouse" tool to move the cursor (no click) to verify / hover.
   5. action=left_click coordinate=[full_x, full_y] — click.
-  6. If you need to verify a result, prefer a *focused* follow-up screenshot (action=get_focused_screenshot around the affected area) over a full-screen screenshot.
+  6. If you need to verify a result, prefer a *focused* follow-up screenshot (action=get_focused_screenshot around the affected area) over a full-screen screenshot — the response will include the new cursor position so you can confirm the click landed where you expected.
 * Coordinates throughout (in get_screenshot, get_focused_screenshot, click, move_mouse) are in the same API image space — the space the model sees in the returned image.`;
 
 const coordinateSchema = z
@@ -482,6 +482,8 @@ export function registerComputer(server: McpServer): void {
 					return encodeScreenshotResponse(image, {
 						image_width: image.getWidth(),
 						image_height: image.getHeight(),
+						cursor_x: cursorInImageX,
+						cursor_y: cursorInImageY,
 					});
 				}
 
@@ -555,6 +557,12 @@ export function registerComputer(server: McpServer): void {
 					const fullApiWidth = logicalWidth / apiToLogical;
 					const fullApiHeight = logicalHeight / apiToLogical;
 
+					// Current cursor position in full-screen API-image space, so the model
+					// knows where the cursor is without needing another screenshot.
+					const cursorPos = await mouse.getPosition();
+					const cursorApiX = Math.floor(cursorPos.x / apiToLogical);
+					const cursorApiY = Math.floor(cursorPos.y / apiToLogical);
+
 					return encodeScreenshotResponse(cropImage, {
 						image_width: returnedImageWidth,
 						image_height: returnedImageHeight,
@@ -564,6 +572,8 @@ export function registerComputer(server: McpServer): void {
 						crop_height: Math.round(cropApiHeight),
 						screen_width: Math.round(fullApiWidth),
 						screen_height: Math.round(fullApiHeight),
+						cursor_x: cursorApiX,
+						cursor_y: cursorApiY,
 					});
 				}
 			}
