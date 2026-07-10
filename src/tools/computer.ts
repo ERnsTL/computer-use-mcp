@@ -227,7 +227,7 @@ export function resolveApiCoordinate(
 
 	if (!regionId.startsWith(REGION_PREFIX)) {
 		throw new Error(
-			`Invalid region "${regionId}". Use "${SCREEN_REGION}" for full-screen coordinates, or echo back a "region:<n>" id from a previous get_screenshot / get_focused_screenshot response.`,
+			`Invalid region "${regionId}". Use "${SCREEN_REGION}" for full-screen coordinates, or echo back a "region:<n>" id from a previous get_screenshot / get_focused_screenshot / refresh_region / focus_region response.`,
 		);
 	}
 
@@ -253,6 +253,143 @@ export function resolveApiCoordinate(
 	};
 }
 
+/**
+ * Look up a region by id and throw a structured error if it is missing
+ * or is the pass-through sentinel `"screen"`. Used by actions that require
+ * a stored region (refresh_region, focus_region).
+ */
+function requireStoredRegion(region: string | undefined): RegionMeta & {regionId: string} {
+	if (!region) {
+		throw new Error('region required: a "region:<n>" id from a previous get_focused_screenshot / refresh_region / focus_region response.');
+	}
+
+	if (region === SCREEN_REGION) {
+		throw new Error('"screen" is not a stored region; refresh_region / focus_region need a "region:<n>" id returned by a previous screenshot.');
+	}
+
+	if (!region.startsWith(REGION_PREFIX)) {
+		throw new Error(
+			`Invalid region "${region}". Use a "region:<n>" id from a previous get_focused_screenshot / refresh_region / focus_region response.`,
+		);
+	}
+
+	const meta = regionRegistry.get(region);
+	if (!meta) {
+		throw new Error(
+			`Unknown region "${region}". Call get_screenshot or get_focused_screenshot first to obtain a valid region id.`,
+		);
+	}
+
+	return {...meta, regionId: region};
+}
+
+/**
+ * Capture the screen, crop to the given API-image rectangle, resize to fit
+ * API size limits, draw a crosshair at the given API-image coordinate, allocate
+ * a fresh region id, and return the encoded MCP response.
+ *
+ * The crop rect is re-clamped against the current screen via `computeCropRect`
+ * so a region that was captured on a larger screen still produces a valid
+ * (possibly smaller) crop on a smaller one. The freshly-allocated region id
+ * is the only handle the model should echo back; the original parent region
+ * is left untouched and may continue to be used until it is FIFO-evicted.
+ */
+async function captureRegionAndEncode(params: {
+	cropApiXMin: number;
+	cropApiYMin: number;
+	cropApiWidth: number;
+	cropApiHeight: number;
+	crosshairApiX: number;
+	crosshairApiY: number;
+}): Promise<{
+	content: (
+		| {type: 'text'; text: string}
+		| {type: 'image'; data: string; mimeType: string}
+	)[];
+}> {
+	// 1) Capture full screen at logical resolution.
+	const fullImage = await grabScreen();
+	const screenLogicalWidth = fullImage.getWidth();
+	const screenLogicalHeight = fullImage.getHeight();
+
+	// 2) Translate the (crop, crosshair) from API image space to logical space
+	//    and re-clamp via computeCropRect (so a region captured on a larger
+	//    screen stays in-bounds on a smaller one).
+	const apiToLogical = await getApiToLogicalScale();
+	const logicalCenterX = (params.cropApiXMin + params.cropApiWidth / 2) * apiToLogical;
+	const logicalCenterY = (params.cropApiYMin + params.cropApiHeight / 2) * apiToLogical;
+	const requestedLogicalWidth = params.cropApiWidth * apiToLogical;
+	const requestedLogicalHeight = params.cropApiHeight * apiToLogical;
+	const {cropX, cropY, cropWidth, cropHeight} = computeCropRect({
+		logicalCenterX,
+		logicalCenterY,
+		logicalWidth: requestedLogicalWidth,
+		logicalHeight: requestedLogicalHeight,
+		screenLogicalWidth,
+		screenLogicalHeight,
+	});
+
+	// 3) Crop the image (jimp is in-place via the returned object).
+	const cropImage = fullImage.clone();
+	cropImage.crop(cropX, cropY, cropWidth, cropHeight);
+
+	// 4) Resize crop to fit API limits (400–600 typically needs no downsample).
+	const cropScaleFactor = getSizeToApiScale(cropImage.getWidth(), cropImage.getHeight());
+	if (cropScaleFactor < 1) {
+		cropImage.resize(
+			Math.floor(cropImage.getWidth() * cropScaleFactor),
+			Math.floor(cropImage.getHeight() * cropScaleFactor),
+		);
+	}
+
+	// 5) Crosshair at the requested center, in returned-image space.
+	const returnedImageWidth = cropImage.getWidth();
+	const returnedImageHeight = cropImage.getHeight();
+	const {x: inCropX, y: inCropY} = mapApiToCropImage(
+		params.crosshairApiX,
+		params.crosshairApiY,
+		params.cropApiXMin,
+		params.cropApiYMin,
+		params.cropApiWidth,
+		params.cropApiHeight,
+		returnedImageWidth,
+		returnedImageHeight,
+	);
+	drawCrosshair(cropImage, inCropX, inCropY);
+
+	// 6) Full-screen API dimensions + current cursor in full-screen API space.
+	const fullApiWidth = screenLogicalWidth / apiToLogical;
+	const fullApiHeight = screenLogicalHeight / apiToLogical;
+	const cursorPos = await mouse.getPosition();
+	const cursorApiX = Math.floor(cursorPos.x / apiToLogical);
+	const cursorApiY = Math.floor(cursorPos.y / apiToLogical);
+
+	// 7) Allocate a fresh region id. FIFO eviction still applies; the parent
+	//    region (if any) is left in place and may be used until it ages out.
+	const regionId = regionRegistry.allocate({
+		cropApiXMin: params.cropApiXMin,
+		cropApiYMin: params.cropApiYMin,
+		cropApiWidth: params.cropApiWidth,
+		cropApiHeight: params.cropApiHeight,
+		returnedImageWidth,
+		returnedImageHeight,
+	} satisfies RegionMeta);
+
+	return encodeScreenshotResponse(cropImage, {
+		region: regionId,
+		image_width: returnedImageWidth,
+		image_height: returnedImageHeight,
+		crop_x_min: Math.round(params.cropApiXMin),
+		crop_y_min: Math.round(params.cropApiYMin),
+		crop_width: Math.round(params.cropApiWidth),
+		crop_height: Math.round(params.cropApiHeight),
+		screen_width: Math.round(fullApiWidth),
+		screen_height: Math.round(fullApiHeight),
+		cursor_x: cursorApiX,
+		cursor_y: cursorApiY,
+	});
+}
+
 // Define the action enum values
 const ActionEnum = z.enum([
 	'key',
@@ -266,6 +403,8 @@ const ActionEnum = z.enum([
 	'scroll',
 	'get_screenshot',
 	'get_focused_screenshot',
+	'refresh_region',
+	'focus_region',
 	'get_cursor_position',
 ]);
 
@@ -281,7 +420,9 @@ const actionDescription = `The action to perform. The available actions are:
 * double_click: Double-click the left mouse button. If coordinate is provided, moves to that position first.
 * scroll: Scroll the screen in a specified direction. Requires coordinate (moves there first) and text parameter with direction: "up", "down", "left", or "right". Optionally append ":N" to scroll N pixels (default 300), e.g. "down:500".
 * get_screenshot: Take a screenshot of the full screen. Prefer get_focused_screenshot for the second step of the multi-step aiming workflow (see below) to avoid re-sending the whole desktop.
-* get_focused_screenshot: Crop a region of the screen around an approximate coordinate and return just that crop, with metadata describing the crop's position in the full screen. The response carries a "region" id ("region:<n>") that you can echo back on a subsequent click/move/scroll action to address coordinates in the crop's local pixel space.`;
+* get_focused_screenshot: Crop a region of the screen around an approximate coordinate and return just that crop, with metadata describing the crop's position in the full screen. The response carries a "region" id ("region:<n>") that you can echo back on a subsequent click/move/scroll action to address coordinates in the crop's local pixel space.
+* refresh_region: Re-capture the same screen rectangle as an existing region (echoed back as \`region\`), without re-supplying coordinates or size. Allocates a new "region:<n>" id and returns the same response shape as get_focused_screenshot. Useful for refreshing a crop after the underlying screen content has changed (e.g. after a click).
+* focus_region: Create a new, smaller (by default) crop centered on an existing region. Echoes a "region:<n>" as \`region\` and accepts the same \`size\` parameter as get_focused_screenshot; the default size is half the parent region's smaller API-image side. Useful for drilling in one more level without re-deriving the center coordinate.`;
 
 const toolDescription = `Use a mouse and keyboard to interact with a computer, and take screenshots.
 * This is an interface to a desktop GUI. You do not have access to a terminal or applications menu. You must click on desktop icons to start applications.
@@ -305,27 +446,29 @@ Multi-step aiming (precision targeting):
 * Default workflow for precise clicking (and to avoid re-sending the whole desktop multiple times):
   1. action=get_screenshot — identify the rough region of the target element. The response includes a "region" id ("screen") and the cursor_x / cursor_y so you know where the cursor is without re-reading the image.
   2. action=get_focused_screenshot coordinate=[X, Y] size=400 (or 600, or [w, h]) — receive a small crop of the screen around (X, Y), plus metadata describing the crop's position in the full screen. The response carries a "region" id ("region:<n>") that you echo back to address coordinates in this crop.
-  3. In the crop, locate the exact target. Address it directly with the region id:
+  3. If the target is still hard to pinpoint, drill in further with action=focus_region region="region:<n>" size=200 — the new crop is centered on the same screen point but smaller, and carries a fresh "region:<n>" id.
+  4. If the underlying screen content has changed (e.g. a dialog opened, an animation finished), re-capture the same crop with action=refresh_region region="region:<n>" — no need to re-derive the center or size; a new "region:<n>" id is returned.
+  5. Once the target is identified, address it directly with the (latest) region id:
      action=left_click region="region:<n>" coordinate=[local_x, local_y]
      The server translates the local coordinates back to full-screen API coordinates for you — no arithmetic on your side.
-  4. Optionally use the separate "move_mouse" tool (with the same region / coordinate pattern) to move the cursor (no click) to verify / hover.
-  5. If you need to verify a result, prefer a *focused* follow-up screenshot (action=get_focused_screenshot around the affected area) over a full-screen screenshot — the response will include the new cursor position so you can confirm the click landed where you expected.
-* Coordinates throughout (in get_screenshot, get_focused_screenshot, click, move_mouse) are in the same API image space — the space the model sees in the returned image. Passing a region from a previous screenshot response switches coordinate interpretation to that region's local pixel space.`;
+  6. Optionally use the separate "move_mouse" tool (with the same region / coordinate pattern) to move the cursor (no click) to verify / hover.
+  7. If you need to verify a result, prefer refresh_region on the region you just acted on over a full-screen screenshot — the response will include the new cursor position so you can confirm the click landed where you expected.
+* Coordinates throughout (in get_screenshot, get_focused_screenshot, refresh_region, focus_region, click, move_mouse) are in the same API image space — the space the model sees in the returned image. Passing a region from a previous screenshot response switches coordinate interpretation to that region's local pixel space.`;
 
 const coordinateSchema = z
 	.array(z.number())
 	.length(2)
-	.describe('(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates. In full-screen API image space if `region` is omitted or "screen"; in the named region\'s local pixel space otherwise.');
+	.describe('(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates. In full-screen API image space if `region` is omitted or "screen"; in the named region\'s local pixel space otherwise. Required for actions that move or click; optional (and unused) for refresh_region.');
 
 const regionSchema = z
 	.string()
 	.optional()
-	.describe(`Opaque handle from a previous get_screenshot ("screen") or get_focused_screenshot ("region:<n>") response. Defaults to "screen" (full-screen API image space). When set, \`coordinate\` is interpreted in the named region's local pixel space and the server maps it back to full-screen API coordinates internally.`);
+	.describe(`Opaque handle from a previous get_screenshot ("screen") or get_focused_screenshot / refresh_region / focus_region ("region:<n>") response. Defaults to "screen" (full-screen API image space). When set, \`coordinate\` is interpreted in the named region's local pixel space and the server maps it back to full-screen API coordinates internally. Required (and must be a stored "region:<n>", not "screen") for refresh_region and focus_region.`);
 
 const sizeSchema = z
 	.union([z.number().int().positive(), z.array(z.number().int().positive()).length(2)])
 	.optional()
-	.describe('Crop size in API image pixels, for get_focused_screenshot. A single number N means an NxN square crop. A 2-element array [w, h] means a rectangular crop. Default: 400 (400x400).');
+	.describe('Crop size in API image pixels, for get_focused_screenshot and focus_region. A single number N means an NxN square crop. A 2-element array [w, h] means a rectangular crop. Default: 400 for get_focused_screenshot; half the parent region\'s smaller API-image side for focus_region.');
 
 export function registerComputer(server: McpServer): void {
 	server.registerTool(
@@ -571,95 +714,81 @@ export function registerComputer(server: McpServer): void {
 						? requestedSize
 						: [requestedSize, requestedSize];
 
-					// 1) Capture full screen at logical resolution.
-					const fullImage = await grabScreen();
-					const logicalWidth = fullImage.getWidth();
-					const logicalHeight = fullImage.getHeight();
+					// Translate (coordinate, size) to an API-image crop rect and
+					// let captureRegionAndEncode do the crop / resize / crosshair /
+					// region-allocate / encode dance. The crosshair is the
+					// requested center.
+					const cropApiWidth = requestedWidth;
+					const cropApiHeight = requestedHeight;
+					const cropApiXMin = resolved.x - cropApiWidth / 2;
+					const cropApiYMin = resolved.y - cropApiHeight / 2;
 
-					// 2) Translate the (coordinate, size) from API image space to logical space.
-					const apiToLogical = await getApiToLogicalScale();
-					const logicalCenterX = resolved.x * apiToLogical;
-					const logicalCenterY = resolved.y * apiToLogical;
-					const logicalWidthReq = requestedWidth * apiToLogical;
-					const logicalHeightReq = requestedHeight * apiToLogical;
-
-					// 3) Compute crop rectangle, clamped to display bounds.
-					const {cropX, cropY, cropWidth, cropHeight} = computeCropRect({
-						logicalCenterX,
-						logicalCenterY,
-						logicalWidth: logicalWidthReq,
-						logicalHeight: logicalHeightReq,
-						screenLogicalWidth: logicalWidth,
-						screenLogicalHeight: logicalHeight,
+					return captureRegionAndEncode({
+						cropApiXMin,
+						cropApiYMin,
+						cropApiWidth,
+						cropApiHeight,
+						crosshairApiX: resolved.x,
+						crosshairApiY: resolved.y,
 					});
+				}
 
-					// 4) Crop the image (jimp is in-place via the returned object).
-					const cropImage = fullImage.clone();
-					cropImage.crop(cropX, cropY, cropWidth, cropHeight);
+				case 'refresh_region': {
+					// Look up the parent region (must be a stored "region:<n>",
+					// not "screen"). Throws a structured error otherwise.
+					const parent = requireStoredRegion(region);
 
-					// 5) Resize crop to fit API limits (400–600 typically needs no downsample).
-					const cropScaleFactor = getSizeToApiScale(cropImage.getWidth(), cropImage.getHeight());
-					if (cropScaleFactor < 1) {
-						cropImage.resize(
-							Math.floor(cropImage.getWidth() * cropScaleFactor),
-							Math.floor(cropImage.getHeight() * cropScaleFactor),
-						);
+					// Re-capture the same API-image crop with the crosshair at the
+					// crop's center. A new region id is allocated inside the helper.
+					const centerApiX = parent.cropApiXMin + parent.cropApiWidth / 2;
+					const centerApiY = parent.cropApiYMin + parent.cropApiHeight / 2;
+					return captureRegionAndEncode({
+						cropApiXMin: parent.cropApiXMin,
+						cropApiYMin: parent.cropApiYMin,
+						cropApiWidth: parent.cropApiWidth,
+						cropApiHeight: parent.cropApiHeight,
+						crosshairApiX: centerApiX,
+						crosshairApiY: centerApiY,
+					});
+				}
+
+				case 'focus_region': {
+					// Same validation as refresh_region.
+					const parent = requireStoredRegion(region);
+
+					// Default size: half the parent region's smaller API-image
+					// side (so a 400x400 parent produces a 200x200 child by
+					// default — the natural "zoom in one more level" step).
+					// If `size` is supplied, use it directly (single number ->
+					// square; [w, h] -> rectangle), so the model can also
+					// zoom out or pick a non-square crop.
+					let cropApiWidth: number;
+					let cropApiHeight: number;
+					if (size === undefined) {
+						const half = Math.max(1, Math.round(Math.min(parent.cropApiWidth, parent.cropApiHeight) / 2));
+						cropApiWidth = half;
+						cropApiHeight = half;
+					} else if (Array.isArray(size)) {
+						[cropApiWidth, cropApiHeight] = size;
+					} else {
+						cropApiWidth = size;
+						cropApiHeight = size;
 					}
 
-					// 6) Crosshair at the requested center, in API image space of the returned crop.
-					//    The center in API-image-of-full-screen is `coordinate`; convert to API-image-of-crop space.
-					const cropApiXMin = cropX / apiToLogical;
-					const cropApiYMin = cropY / apiToLogical;
-					const cropApiWidth = cropWidth / apiToLogical;
-					const cropApiHeight = cropHeight / apiToLogical;
-					const returnedImageWidth = cropImage.getWidth();
-					const returnedImageHeight = cropImage.getHeight();
-					const {x: inCropX, y: inCropY} = mapApiToCropImage(
-						resolved.x,
-						resolved.y,
+					// Center the new crop on the parent region's center; the
+					// model does not need to re-derive it.
+					const centerApiX = parent.cropApiXMin + parent.cropApiWidth / 2;
+					const centerApiY = parent.cropApiYMin + parent.cropApiHeight / 2;
+					const cropApiXMin = centerApiX - cropApiWidth / 2;
+					const cropApiYMin = centerApiY - cropApiHeight / 2;
+
+					return captureRegionAndEncode({
 						cropApiXMin,
 						cropApiYMin,
 						cropApiWidth,
 						cropApiHeight,
-						returnedImageWidth,
-						returnedImageHeight,
-					);
-					drawCrosshair(cropImage, inCropX, inCropY);
-
-					// Full-screen API dimensions for the model to interpret crop offsets.
-					const fullApiWidth = logicalWidth / apiToLogical;
-					const fullApiHeight = logicalHeight / apiToLogical;
-
-					// Current cursor position in full-screen API-image space, so the model
-					// knows where the cursor is without needing another screenshot.
-					const cursorPos = await mouse.getPosition();
-					const cursorApiX = Math.floor(cursorPos.x / apiToLogical);
-					const cursorApiY = Math.floor(cursorPos.y / apiToLogical);
-
-					// Allocate a region id for this crop so the model can echo it
-					// back on a subsequent click/move/scroll. The id is part of
-					// the response so the model does not have to guess it.
-					const regionId = regionRegistry.allocate({
-						cropApiXMin,
-						cropApiYMin,
-						cropApiWidth,
-						cropApiHeight,
-						returnedImageWidth,
-						returnedImageHeight,
-					} satisfies RegionMeta);
-
-					return encodeScreenshotResponse(cropImage, {
-						region: regionId,
-						image_width: returnedImageWidth,
-						image_height: returnedImageHeight,
-						crop_x_min: Math.round(cropApiXMin),
-						crop_y_min: Math.round(cropApiYMin),
-						crop_width: Math.round(cropApiWidth),
-						crop_height: Math.round(cropApiHeight),
-						screen_width: Math.round(fullApiWidth),
-						screen_height: Math.round(fullApiHeight),
-						cursor_x: cursorApiX,
-						cursor_y: cursorApiY,
+						crosshairApiX: centerApiX,
+						crosshairApiY: centerApiY,
 					});
 				}
 			}
@@ -669,7 +798,8 @@ export function registerComputer(server: McpServer): void {
 
 /**
  * Draw a red crosshair at (cx, cy) on the given Jimp image. Out-of-bounds
- * coordinates are clipped. Used by get_screenshot and get_focused_screenshot.
+ * coordinates are clipped. Used by get_screenshot, get_focused_screenshot,
+ * refresh_region and focus_region.
  */
 function drawCrosshair(image: ReturnType<typeof imageToJimp>, cx: number, cy: number): void {
 	const crosshairSize = 20;
@@ -710,8 +840,8 @@ function drawCrosshair(image: ReturnType<typeof imageToJimp>, cx: number, cy: nu
 
 /**
  * Encode a Jimp image as PNG via sharp and return an MCP tool result with
- * a JSON metadata text block + a base64 image block. Used by get_screenshot
- * and get_focused_screenshot.
+ * a JSON metadata text block + a base64 image block. Used by get_screenshot,
+ * get_focused_screenshot, refresh_region and focus_region.
  */
 async function encodeScreenshotResponse(
 	image: ReturnType<typeof imageToJimp>,

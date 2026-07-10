@@ -100,12 +100,12 @@ This talks to your computer using [nut.js](https://github.com/nut-tree/nut.js)
 
 ## Multi-step aiming (precision targeting)
 
-For precise clicking on a large desktop (e.g. 1920×2160 dual-stacked, 4K, etc.), the model only has limited "visual attention" to spend on a full screenshot, so a single direct click on a small button is unreliable. This server supports a two-step workflow that significantly improves click precision without changing the underlying vision model.
+For precise clicking on a large desktop (e.g. 1920×2160 dual-stacked, 4K, etc.), the model only has limited "visual attention" to spend on a full screenshot, so a single direct click on a small button is unreliable. This server supports a region-based workflow that significantly improves click precision without changing the underlying vision model.
 
 Every screenshot response carries a `region` field — an opaque handle you echo back on a follow-up click / move / scroll so the server can do the coordinate translation for you:
 
 - `get_screenshot` returns `region: "screen"`.
-- `get_focused_screenshot` returns `region: "region:<n>"` (a fresh, monotonically increasing id per crop).
+- `get_focused_screenshot`, `refresh_region`, and `focus_region` each return a fresh `region: "region:<n>"` (a monotonically increasing id per crop, with FIFO eviction).
 
 The recommended workflow:
 
@@ -115,17 +115,19 @@ The recommended workflow:
    - `crop_x_min`, `crop_y_min`, `crop_width`, `crop_height` — the crop's position and size in full-screen API-image space (still useful for the model to reason about the crop, but no longer needed for arithmetic).
    - `screen_width`, `screen_height` — the full screen in API-image space.
    - `cursor_x`, `cursor_y` — the current cursor position in **full-screen API-image space** (not the crop's). This is the most important iteration-saver: you can tell at a glance whether the previous click landed where you expected, without taking another screenshot.
-3. In the crop, locate the exact target. Address it directly with the region id — **no arithmetic on your side**:
+3. If the target is still hard to pinpoint, drill in one more level with `computer` action `focus_region region="region:<n>"` (optionally `size=200` to override the default — half the parent's API-image side, i.e. a tighter crop centered on the same screen point). The response carries a fresh `region: "region:<n>"` you can echo back on the next click. Repeat as needed; each `focus_region` allocates a new id.
+4. If the underlying screen content has changed (a dialog opened, an animation finished, a page loaded), re-capture the *same* crop with `computer` action `refresh_region region="region:<n>"` — no need to re-derive center or size; a new `region: "region:<n>"` is returned with the same `crop_*` metadata and an up-to-date image.
+5. In the latest crop, locate the exact target. Address it directly with the (latest) region id — **no arithmetic on your side**:
    ```json
    {"action": "left_click", "region": "region:<n>", "coordinate": [local_x, local_y]}
    ```
    The server maps `local_x, local_y` from the crop's local pixel space back to full-screen API-image coordinates and clicks there.
-4. Optionally use the dedicated `move_mouse` top-level tool (with the same `region` + `coordinate` shape) to move the cursor (no click) and verify / hover.
-5. To verify a result, prefer a *focused* follow-up screenshot (`get_focused_screenshot` around the affected area) over a full-screen screenshot. The new `cursor_x` / `cursor_y` in the response will tell you whether the click landed where you expected, sparing an extra screenshot.
+6. Optionally use the dedicated `move_mouse` top-level tool (with the same `region` + `coordinate` shape) to move the cursor (no click) and verify / hover.
+7. To verify a result, prefer `refresh_region` on the region you just acted on over a full-screen screenshot. The new `cursor_x` / `cursor_y` in the response will tell you whether the click landed where you expected, sparing an extra screenshot.
 
 The `region` field is **optional** and defaults to `"screen"`. Existing call sites that pass only `coordinate=[x, y]` continue to work unchanged — the `coordinate` is then interpreted in full-screen API-image space, exactly like before. The `region:` prefix is shared (rather than `crop:`) so future region kinds (OCR regions, windows, UIA elements, browser elements, …) can reuse the same namespace.
 
-Internally, the server keeps an in-memory map of recent regions capped at 100 entries with FIFO eviction (no TTL, no timers). The `region` is just an opaque handle to the model — it should always echo back exactly the value from a prior screenshot response.
+Internally, the server keeps an in-memory map of recent regions capped at 100 entries with FIFO eviction (no TTL, no timers). The `region` is just an opaque handle to the model — it should always echo back exactly the value from a prior screenshot response. `refresh_region` and `focus_region` allocate a fresh id on each call (the parent region is left in place and may continue to be used until it ages out), so the model can use them to drill in or refresh without losing the parent's handle.
 
 The `move_mouse` top-level tool is a focused, single-purpose way to move the cursor without any other side effect. (The same effect is also available as `computer` action `mouse_move` for backward compatibility.)
 

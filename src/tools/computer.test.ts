@@ -424,4 +424,247 @@ describe('computer tool — region-relative coordinates', () => {
 			await client.close();
 		}
 	});
+
+	// ----- refresh_region -----
+
+	it('refresh_region re-allocates a new region id for the same crop', async () => {
+		const server = new McpServer({name: 'test', version: '0.0.1'});
+		registerComputer(server);
+		const client = createClient(server);
+
+		try {
+			// Allocate a parent region via get_focused_screenshot.
+			const focused = await client.sendRequest<{content: Array<{type: string; text?: string}>}>({
+				jsonrpc: '2.0',
+				id: '1',
+				method: 'tools/call',
+				params: {name: 'computer', arguments: {action: 'get_focused_screenshot', coordinate: [SCREEN_CX, SCREEN_CY], size: 80}},
+			});
+			const parent = JSON.parse(focused.content[0]?.text ?? '{}') as {region: string; crop_x_min: number; crop_y_min: number; crop_width: number; crop_height: number; image_width: number; image_height: number};
+			expect(parent.region).toMatch(/^region:\d+$/);
+			expect(parent.crop_x_min).toBe(120);
+			expect(parent.crop_y_min).toBe(50);
+			expect(parent.crop_width).toBe(80);
+			expect(parent.crop_height).toBe(80);
+
+			// refresh_region must return a new region id with identical crop metadata.
+			const refreshed = await client.sendRequest<{content: Array<{type: string; text?: string}>}>({
+				jsonrpc: '2.0',
+				id: '2',
+				method: 'tools/call',
+				params: {name: 'computer', arguments: {action: 'refresh_region', region: parent.region}},
+			});
+			const meta = JSON.parse(refreshed.content[0]?.text ?? '{}') as {region: string; crop_x_min: number; crop_y_min: number; crop_width: number; crop_height: number; image_width: number; image_height: number};
+			expect(meta.region).toMatch(/^region:\d+$/);
+			expect(meta.region).not.toBe(parent.region);
+			expect(meta.crop_x_min).toBe(parent.crop_x_min);
+			expect(meta.crop_y_min).toBe(parent.crop_y_min);
+			expect(meta.crop_width).toBe(parent.crop_width);
+			expect(meta.crop_height).toBe(parent.crop_height);
+			expect(meta.image_width).toBe(parent.image_width);
+			expect(meta.image_height).toBe(parent.image_height);
+		} finally {
+			await client.close();
+		}
+	});
+
+	it('refresh_region errors when the region is missing / "screen" / malformed / unknown', async () => {
+		const server = new McpServer({name: 'test', version: '0.0.1'});
+		registerComputer(server);
+		const client = createClient(server);
+
+		try {
+			// No region at all.
+			const r1 = await client.sendRequest<{isError?: boolean; content: Array<{text: string}>}>({
+				jsonrpc: '2.0',
+				id: '1',
+				method: 'tools/call',
+				params: {name: 'computer', arguments: {action: 'refresh_region'}},
+			});
+			expect(r1.isError).toBe(true);
+			expect(r1.content[0]?.text).toMatch(/region required/);
+
+			// "screen" is the pass-through sentinel, not a stored region.
+			const r2 = await client.sendRequest<{isError?: boolean; content: Array<{text: string}>}>({
+				jsonrpc: '2.0',
+				id: '2',
+				method: 'tools/call',
+				params: {name: 'computer', arguments: {action: 'refresh_region', region: 'screen'}},
+			});
+			expect(r2.isError).toBe(true);
+			expect(r2.content[0]?.text).toMatch(/not a stored region/);
+
+			// Malformed (no "region:" prefix).
+			const r3 = await client.sendRequest<{isError?: boolean; content: Array<{text: string}>}>({
+				jsonrpc: '2.0',
+				id: '3',
+				method: 'tools/call',
+				params: {name: 'computer', arguments: {action: 'refresh_region', region: 'banana'}},
+			});
+			expect(r3.isError).toBe(true);
+			expect(r3.content[0]?.text).toMatch(/Invalid region/);
+
+			// Unknown but well-formed region id.
+			const r4 = await client.sendRequest<{isError?: boolean; content: Array<{text: string}>}>({
+				jsonrpc: '2.0',
+				id: '4',
+				method: 'tools/call',
+				params: {name: 'computer', arguments: {action: 'refresh_region', region: 'region:999'}},
+			});
+			expect(r4.isError).toBe(true);
+			expect(r4.content[0]?.text).toMatch(/Unknown region/);
+		} finally {
+			await client.close();
+		}
+	});
+
+	// ----- focus_region -----
+
+	it('focus_region defaults to a half-size crop centered on the parent', async () => {
+		const server = new McpServer({name: 'test', version: '0.0.1'});
+		registerComputer(server);
+		const client = createClient(server);
+
+		try {
+			// Parent: 80x80 crop centered on (SCREEN_CX, SCREEN_CY) = (160, 90),
+			// i.e. cropApiXMin = 120, cropApiYMin = 50.
+			const focused = await client.sendRequest<{content: Array<{type: string; text?: string}>}>({
+				jsonrpc: '2.0',
+				id: '1',
+				method: 'tools/call',
+				params: {name: 'computer', arguments: {action: 'get_focused_screenshot', coordinate: [SCREEN_CX, SCREEN_CY], size: 80}},
+			});
+			const parent = JSON.parse(focused.content[0]?.text ?? '{}') as {region: string};
+
+			// Default size = half of min(80, 80) = 40. Center stays at (160, 90).
+			// New cropX = 160 - 20 = 140, cropY = 90 - 20 = 70, 40x40.
+			const focused2 = await client.sendRequest<{content: Array<{type: string; text?: string}>}>({
+				jsonrpc: '2.0',
+				id: '2',
+				method: 'tools/call',
+				params: {name: 'computer', arguments: {action: 'focus_region', region: parent.region}},
+			});
+			const child = JSON.parse(focused2.content[0]?.text ?? '{}') as {region: string; crop_x_min: number; crop_y_min: number; crop_width: number; crop_height: number; image_width: number; image_height: number};
+			expect(child.region).toMatch(/^region:\d+$/);
+			expect(child.region).not.toBe(parent.region);
+			expect(child.crop_x_min).toBe(140);
+			expect(child.crop_y_min).toBe(70);
+			expect(child.crop_width).toBe(40);
+			expect(child.crop_height).toBe(40);
+			expect(child.image_width).toBe(40);
+			expect(child.image_height).toBe(40);
+		} finally {
+			await client.close();
+		}
+	});
+
+	it('focus_region honors an explicit size', async () => {
+		const server = new McpServer({name: 'test', version: '0.0.1'});
+		registerComputer(server);
+		const client = createClient(server);
+
+		try {
+			const focused = await client.sendRequest<{content: Array<{type: string; text?: string}>}>({
+				jsonrpc: '2.0',
+				id: '1',
+				method: 'tools/call',
+				params: {name: 'computer', arguments: {action: 'get_focused_screenshot', coordinate: [SCREEN_CX, SCREEN_CY], size: 80}},
+			});
+			const parent = JSON.parse(focused.content[0]?.text ?? '{}') as {region: string};
+
+			// Explicit 20x20 crop centered on (160, 90): cropX=150, cropY=80.
+			const focused2 = await client.sendRequest<{content: Array<{type: string; text?: string}>}>({
+				jsonrpc: '2.0',
+				id: '2',
+				method: 'tools/call',
+				params: {name: 'computer', arguments: {action: 'focus_region', region: parent.region, size: 20}},
+			});
+			const child = JSON.parse(focused2.content[0]?.text ?? '{}') as {crop_x_min: number; crop_y_min: number; crop_width: number; crop_height: number};
+			expect(child.crop_x_min).toBe(150);
+			expect(child.crop_y_min).toBe(80);
+			expect(child.crop_width).toBe(20);
+			expect(child.crop_height).toBe(20);
+		} finally {
+			await client.close();
+		}
+	});
+
+	it('focus_region errors when the region is missing / "screen" / unknown', async () => {
+		const server = new McpServer({name: 'test', version: '0.0.1'});
+		registerComputer(server);
+		const client = createClient(server);
+
+		try {
+			const r1 = await client.sendRequest<{isError?: boolean; content: Array<{text: string}>}>({
+				jsonrpc: '2.0',
+				id: '1',
+				method: 'tools/call',
+				params: {name: 'computer', arguments: {action: 'focus_region'}},
+			});
+			expect(r1.isError).toBe(true);
+			expect(r1.content[0]?.text).toMatch(/region required/);
+
+			const r2 = await client.sendRequest<{isError?: boolean; content: Array<{text: string}>}>({
+				jsonrpc: '2.0',
+				id: '2',
+				method: 'tools/call',
+				params: {name: 'computer', arguments: {action: 'focus_region', region: 'screen'}},
+			});
+			expect(r2.isError).toBe(true);
+			expect(r2.content[0]?.text).toMatch(/not a stored region/);
+
+			const r3 = await client.sendRequest<{isError?: boolean; content: Array<{text: string}>}>({
+				jsonrpc: '2.0',
+				id: '3',
+				method: 'tools/call',
+				params: {name: 'computer', arguments: {action: 'focus_region', region: 'region:999'}},
+			});
+			expect(r3.isError).toBe(true);
+			expect(r3.content[0]?.text).toMatch(/Unknown region/);
+		} finally {
+			await client.close();
+		}
+	});
+
+	it('get_focused_screenshot → focus_region → left_click round-trip translates back to the same full-screen coordinate', async () => {
+		const server = new McpServer({name: 'test', version: '0.0.1'});
+		registerComputer(server);
+		const client = createClient(server);
+
+		try {
+			// Step 1: 80x80 focused crop at the screen center → region:1, crop (120, 50, 80, 80).
+			const focused = await client.sendRequest<{content: Array<{type: string; text?: string}>}>({
+				jsonrpc: '2.0',
+				id: '1',
+				method: 'tools/call',
+				params: {name: 'computer', arguments: {action: 'get_focused_screenshot', coordinate: [SCREEN_CX, SCREEN_CY], size: 80}},
+			});
+			const parent = JSON.parse(focused.content[0]?.text ?? '{}') as {region: string};
+
+			// Step 2: focus in to a 40x40 crop centered on the same point → region:2, crop (140, 70, 40, 40).
+			const focused2 = await client.sendRequest<{content: Array<{type: string; text?: string}>}>({
+				jsonrpc: '2.0',
+				id: '2',
+				method: 'tools/call',
+				params: {name: 'computer', arguments: {action: 'focus_region', region: parent.region}},
+			});
+			const child = JSON.parse(focused2.content[0]?.text ?? '{}') as {region: string};
+
+			// Step 3: click at local (20, 20) in the 40x40 child crop. That maps
+			// back to full-screen (140 + 20 * 40/40, 70 + 20 * 40/40) = (160, 90).
+			setPositionMock.mockClear();
+			await client.sendRequest({
+				jsonrpc: '2.0',
+				id: '3',
+				method: 'tools/call',
+				params: {name: 'computer', arguments: {action: 'left_click', coordinate: [20, 20], region: child.region}},
+			});
+
+			const passedPoint = setPositionMock.mock.calls[0]?.[0] as {x: number; y: number};
+			expect(passedPoint.x).toBe(SCREEN_CX);
+			expect(passedPoint.y).toBe(SCREEN_CY);
+		} finally {
+			await client.close();
+		}
+	});
 });
