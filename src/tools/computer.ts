@@ -9,7 +9,7 @@ import {
 	imageToJimp,
 } from '@nut-tree-fork/nut-js';
 import {execFileSync} from 'node:child_process';
-import {readFileSync, unlinkSync} from 'node:fs';
+import {existsSync, readFileSync, unlinkSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import Jimp from 'jimp';
@@ -18,26 +18,83 @@ import {toKeys} from '../utils/xdotoolStringToKeys.js';
 import {jsonResult} from '../utils/response.js';
 
 /**
- * Grab the screen, falling back to the macOS `screencapture` CLI if nut-js fails
- * (e.g. on macOS 26+ where CGDisplayCreateImageForRect was removed).
+ * Grab the screen. Strategy:
+ *   1. On Linux/macOS, try the `screencapture` CLI (a shim that wraps
+ *      gnome-screenshot / ImageMagick `import` / `ffmpeg -f x11grab`).
+ *      On Linux+X11+Compositor, libnut returns a near-empty / black image,
+ *      so the shim is the primary path here.
+ *   2. Fall back to libnut (works for input/keyboard; screen capture is
+ *      only reliable on macOS / Windows).
+ *   3. As a last resort, re-run the shim and accept whatever it returns
+ *      (better than throwing and crashing the MCP stdio transport).
  */
 async function grabScreen(): Promise<ReturnType<typeof imageToJimp>> {
-	try {
-		return imageToJimp(await screen.grab());
-	} catch {
-		// Fallback: use screencapture CLI (macOS only)
-		const tmpPath = join(tmpdir(), `computer-use-mcp-${Date.now()}.png`);
+	const tmpPath = join(tmpdir(), `computer-use-mcp-${Date.now()}.png`);
+
+	const readTmpAsJimp = async (): Promise<ReturnType<typeof imageToJimp>> => {
+		const buffer = readFileSync(tmpPath);
+		return (await Jimp.read(buffer)) as unknown as ReturnType<typeof imageToJimp>;
+	};
+
+	// Heuristic: detect the libnut "black/garbage" image (composited X11).
+	const isLikelyEmpty = async (img: { getWidth(): number; getHeight(): number }): Promise<boolean> => {
+		const w = img.getWidth();
+		const h = img.getHeight();
+		if (w * h < 100_000) return true;
 		try {
-			execFileSync('screencapture', ['-x', tmpPath]);
-			const buffer = readFileSync(tmpPath);
-			return (await Jimp.read(buffer)) as unknown as ReturnType<typeof imageToJimp>;
-		} finally {
-			try {
-				unlinkSync(tmpPath);
-			} catch {
-				/* ignore cleanup errors */
+			let nonBlack = 0;
+			const stepX = Math.max(1, Math.floor(w / 64));
+			const stepY = Math.max(1, Math.floor(h / 64));
+			for (let y = 0; y < h; y += stepY) {
+				for (let x = 0; x < w; x += stepX) {
+					const px = (img as unknown as Jimp).getPixelColor(x, y);
+					const r = (px >>> 24) & 0xff;
+					const g = (px >>> 16) & 0xff;
+					const b = (px >>> 8) & 0xff;
+					if (r > 16 || g > 16 || b > 16) {
+						nonBlack++;
+						if (nonBlack > 5) return false;
+					}
+				}
 			}
+			return true;
+		} catch {
+			return false;
 		}
+	};
+
+	const tryShim = async (): Promise<ReturnType<typeof imageToJimp> | null> => {
+		try {
+			execFileSync('screencapture', ['-x', tmpPath], {stdio: 'ignore'});
+			if (!existsSync(tmpPath)) return null;
+			const img = await readTmpAsJimp();
+			if (await isLikelyEmpty(img)) return null;
+			return img;
+		} catch {
+			return null;
+		} finally {
+			try { unlinkSync(tmpPath); } catch { /* ignore */ }
+		}
+	};
+
+	// 1) Prefer the screencapture shim on Linux / macOS.
+	if (process.platform === 'linux' || process.platform === 'darwin') {
+		const shimResult = await tryShim();
+		if (shimResult) return shimResult;
+	}
+
+	// 2) Fall back to libnut. If the image looks empty, treat as failure.
+	try {
+		const jimpImg = imageToJimp(await screen.grab());
+		if (!(await isLikelyEmpty(jimpImg))) return jimpImg;
+	} catch { /* fall through */ }
+
+	// 3) Last resort: shim again, accept whatever it returns.
+	try {
+		execFileSync('screencapture', ['-x', tmpPath], {stdio: 'ignore'});
+		return await readTmpAsJimp();
+	} finally {
+		try { unlinkSync(tmpPath); } catch { /* ignore */ }
 	}
 }
 
@@ -86,15 +143,16 @@ function xdotoolType(text: string): void {
 	});
 }
 
-// The Claude API automatically downsamples images larger than ~1.15MP or 1568px on the long edge.
-// We already downsampled screenshots to fit these limits and reported the original screen
-// dimensions via display_width_px/display_height_px, but Claude wasn't correctly using those
-// reported dimensions - it was using coordinates from the downsampled image space directly.
-// As a workaround, we now report the actual image dimensions and scale Claude's coordinates
-// back up to logical screen coordinates.
-// See: https://docs.anthropic.com/en/docs/build-with-claude/vision#evaluate-image-size
-const maxLongEdge = 1568;
-const maxPixels = 1.15 * 1024 * 1024; // 1.15 megapixels
+// Send the screenshot at its native screen resolution. The Claude API will
+// downsample it on its end if it exceeds the API's vision limits. The MCP
+// previously downsampled to ~1.15MP / 1568px before sending, but that
+// destroyed detail on common multi-monitor setups (e.g. two stacked 1080p
+// monitors = 1920x2160) and the model had to work with a half-resolution
+// image. Limits below are set high enough that typical desktop setups
+// (up to 4K-wide and 16MP total) pass through untouched. Only extreme
+// configurations trigger a downsample.
+const maxLongEdge = 4096;             // 4K on the long edge
+const maxPixels = 16 * 1024 * 1024;   // 16 megapixels
 
 /**
  * Calculate the scale factor to downsample an image to fit API limits.

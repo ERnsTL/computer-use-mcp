@@ -1,0 +1,75 @@
+#!/bin/bash
+# screencapture shim — emulates macOS `screencapture -x <file>` on Linux.
+#
+# Order is chosen to AVOID the white "shutter" flash that GNOME Shell
+# triggers when a screenshot is taken through its compositor API
+# (e.g. via gnome-screenshot). All preferred tools go directly to the
+# X11 server via XGetImage / MIT-SHM, bypassing the compositor, so no
+# flash is shown to the user.
+#
+#   1) ffmpeg -f x11grab     — MIT-SHM, no flash, fastest for large screens
+#   2) ImageMagick `import`  — direct X11, no flash (universal fallback)
+#   3) gnome-screenshot      — LAST RESORT, flashes the screen
+#
+# Note: `xwd | convert` was tried but fails on this system because
+# ImageMagick 6 has a known bug reading XWD from stdin (BadColor /
+# invalid Colormap). Left out until that is fixed upstream.
+#
+# macOS-style flags (e.g. -x, -R, -t) are accepted and ignored; only the
+# output filename (the last non-flag argument) is used.
+
+set -e
+
+outfile=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --) shift; outfile="${!#}"; break;;
+    -*) shift;;
+    *) outfile="$1"; shift; break;;
+  esac
+done
+
+if [[ -z "$outfile" ]]; then
+  echo "screencapture: no output file specified" >&2
+  echo "Usage: screencapture [-x] <output.png>" >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "$outfile")"
+: > "$outfile"  # truncate
+
+err_log=$(mktemp)
+trap 'rm -f "$err_log"' EXIT
+
+# 1) ffmpeg x11grab (MIT-SHM, no compositor flash)
+if command -v ffmpeg >/dev/null 2>&1; then
+  if command -v xrandr >/dev/null 2>&1; then
+    # Extract "current 1920 x 2160" from the xrandr summary line.
+    size=$(xrandr 2>/dev/null | grep -oP 'current \K[0-9]+ x [0-9]+' | head -1 | tr -d ' ' | tr 'x' 'x')
+  fi
+  size="${size:-1920x1080}"
+  display="${DISPLAY:-:0}"
+  if ffmpeg -y -loglevel error -f x11grab -video_size "$size" -i "$display" -vframes 1 "$outfile" 2>"$err_log"; then
+    [[ -s "$outfile" ]] && exit 0
+  fi
+fi
+
+# 2) ImageMagick `import` (direct XGetImage, no compositor flash)
+if command -v import >/dev/null 2>&1; then
+  if import -window root "$outfile" 2>"$err_log"; then
+    [[ -s "$outfile" ]] && exit 0
+  fi
+fi
+
+# 4) Last resort: gnome-screenshot. NOTE: this triggers the white
+# "shutter" flash via the GNOME Shell compositor, so prefer the
+# silent X11 tools above whenever possible.
+if command -v gnome-screenshot >/dev/null 2>&1; then
+  if gnome-screenshot -f "$outfile" 2>"$err_log"; then
+    [[ -s "$outfile" ]] && exit 0
+  fi
+fi
+
+echo "screencapture: failed to capture screen. Last error:" >&2
+cat "$err_log" >&2
+exit 1

@@ -16,6 +16,7 @@ if (process.platform === 'darwin') {
 
 import {StdioServerTransport} from '@modelcontextprotocol/sdk/server/stdio.js';
 import {StreamableHTTPServerTransport} from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import type {Transport} from '@modelcontextprotocol/sdk/shared/transport.js';
 import express from 'express';
 import {createServer} from './index.js';
 
@@ -48,13 +49,12 @@ function setupSignalHandlers(cleanup: () => Promise<void>): void {
 		app.post('/mcp', async (req, res) => {
 			const server = createServer();
 			const httpTransport = new StreamableHTTPServerTransport({
-				sessionIdGenerator: undefined,
 				enableJsonResponse: true,
 			});
 			res.on('close', () => {
 				void server.close();
 			});
-			await server.connect(httpTransport);
+			await server.connect(httpTransport as unknown as Transport);
 			await httpTransport.handleRequest(req, res, req.body);
 		});
 

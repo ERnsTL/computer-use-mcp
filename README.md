@@ -13,6 +13,76 @@ https://github.com/user-attachments/assets/cd0bc190-52c4-49db-b3bc-4b8a74544789
 
 Follow the instructions on [install-mcp](https://adamjones.me/install-mcp/?config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsImNvbXB1dGVyLXVzZS1tY3AiXSwibmFtZSI6ImNvbXB1dGVyLXVzZSJ9), which generates the right config for your MCP client (Claude Code, Claude Desktop, Cursor, Cline, VS Code, and more).
 
+## Linux support
+
+Linux is supported via X11. Wayland is not tested.
+
+### System dependencies (Debian/Ubuntu)
+
+```bash
+sudo apt install xdotool ffmpeg imagemagick
+# Only needed as a last-resort fallback (triggers a brief white shutter flash)
+sudo apt install gnome-screenshot
+```
+
+- **xdotool** — required for the `type` action so the active X11 keyboard
+  layout is respected (avoids character swaps on non-US layouts)
+- **ffmpeg** *or* **imagemagick** — needed for screen capture; libnut
+  (the default) returns a black/garbage image on composited X11
+  (Mutter/GNOME Shell), so we route through a shim instead. ffmpeg is
+  recommended (MIT-SHM, no flash).
+- **gnome-screenshot** — optional last-resort, but it triggers a brief
+  white shutter flash from the compositor
+
+### Install the `screencapture` shim
+
+`bin/screencapture` (committed) emulates macOS `screencapture -x <file>`
+on Linux. It tries ffmpeg → ImageMagick → gnome-screenshot in order
+(flash-free first, so the user does not see a white flash).
+
+```bash
+mkdir -p ~/.local/bin
+cp bin/screencapture ~/.local/bin/screencapture
+chmod +x ~/.local/bin/screencapture
+```
+
+`~/.local/bin` is already in `PATH` on most modern Linux distros. If
+not, add it to your shell profile.
+
+### Environment variables
+
+Your MCP client (Cline, Claude Desktop, etc.) spawns the server with its
+own environment, so you must pass X11 credentials explicitly in
+`cline_mcp_settings.json` (or equivalent):
+
+```json
+"computer-use": {
+  "command": "node",
+  "args": ["/path/to/computer-use-mcp/dist/main.js"],
+  "cwd": "/path/to/computer-use-mcp",
+  "env": {
+    "DISPLAY": ":0",
+    "XAUTHORITY": "/run/user/1000/gdm/Xauthority"
+  }
+}
+```
+
+(`XAUTHORITY` is usually `/run/user/$(id -u)/gdm/Xauthority` on GDM
+logins, or `~/.Xauthority` on lightdm/sddm.)
+
+### Troubleshooting
+
+- **"connection closed" / server crashes on startup** — usually means
+  neither `ffmpeg` nor `import` is installed, or
+  `~/.local/bin/screencapture` is not in the server's `PATH`. Run
+  `screencapture -x /tmp/test.png` from a shell to verify the shim works
+  on its own.
+- **Screenshot comes back as 1035×1164 instead of native 1920×2160** —
+  you're probably running an old build. Pull and `npm run build`.
+- **Characters like `:` and `;` get typed wrong** — `xdotool` is
+  missing. Install it. When xdotool is unavailable the MCP falls back
+  to libnut's US-QWERTY character map which is wrong on most layouts.
+
 ## Tips
 
 This should just work out of the box.
