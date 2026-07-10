@@ -25,6 +25,10 @@
     {
       "name": "computer",
       "description": "Use a computer to complete tasks. This tool can take screenshots, click, type, scroll, and more."
+    },
+    {
+      "name": "move_mouse",
+      "description": "Move the mouse cursor to the specified coordinates on the screen, without clicking. Use for hovering, positioning before a click, or verifying the cursor location."
     }
   ],
   "compatibility": {

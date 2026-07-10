@@ -189,6 +189,7 @@ describe.each([
 
 			expect(result.tools.map((t) => t.name)).toEqual([
 				'computer',
+				'move_mouse',
 			]);
 			expect(result.tools[0]).toMatchObject({
 				name: 'computer',

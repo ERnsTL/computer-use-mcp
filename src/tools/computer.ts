@@ -16,6 +16,7 @@ import Jimp from 'jimp';
 import sharp from 'sharp';
 import {toKeys} from '../utils/xdotoolStringToKeys.js';
 import {jsonResult} from '../utils/response.js';
+import {computeCropRect, mapApiToCropImage} from '../utils/cropGeometry.js';
 
 /**
  * Grab the screen. Strategy:
@@ -33,14 +34,17 @@ async function grabScreen(): Promise<ReturnType<typeof imageToJimp>> {
 
 	const readTmpAsJimp = async (): Promise<ReturnType<typeof imageToJimp>> => {
 		const buffer = readFileSync(tmpPath);
-		return (await Jimp.read(buffer)) as unknown as ReturnType<typeof imageToJimp>;
+		return Jimp.read(buffer);
 	};
 
 	// Heuristic: detect the libnut "black/garbage" image (composited X11).
-	const isLikelyEmpty = async (img: { getWidth(): number; getHeight(): number }): Promise<boolean> => {
+	const isLikelyEmpty = async (img: {getWidth(): number; getHeight(): number}): Promise<boolean> => {
 		const w = img.getWidth();
 		const h = img.getHeight();
-		if (w * h < 100_000) return true;
+		if (w * h < 100_000) {
+			return true;
+		}
+
 		try {
 			let nonBlack = 0;
 			const stepX = Math.max(1, Math.floor(w / 64));
@@ -53,10 +57,13 @@ async function grabScreen(): Promise<ReturnType<typeof imageToJimp>> {
 					const b = (px >>> 8) & 0xff;
 					if (r > 16 || g > 16 || b > 16) {
 						nonBlack++;
-						if (nonBlack > 5) return false;
+						if (nonBlack > 5) {
+							return false;
+						}
 					}
 				}
 			}
+
 			return true;
 		} catch {
 			return false;
@@ -66,35 +73,49 @@ async function grabScreen(): Promise<ReturnType<typeof imageToJimp>> {
 	const tryShim = async (): Promise<ReturnType<typeof imageToJimp> | null> => {
 		try {
 			execFileSync('screencapture', ['-x', tmpPath], {stdio: 'ignore'});
-			if (!existsSync(tmpPath)) return null;
+			if (!existsSync(tmpPath)) {
+				return null;
+			}
+
 			const img = await readTmpAsJimp();
-			if (await isLikelyEmpty(img)) return null;
+			if (await isLikelyEmpty(img)) {
+				return null;
+			}
+
 			return img;
 		} catch {
 			return null;
 		} finally {
-			try { unlinkSync(tmpPath); } catch { /* ignore */ }
+			try {
+				unlinkSync(tmpPath);
+			} catch {/* ignore */}
 		}
 	};
 
 	// 1) Prefer the screencapture shim on Linux / macOS.
 	if (process.platform === 'linux' || process.platform === 'darwin') {
 		const shimResult = await tryShim();
-		if (shimResult) return shimResult;
+		if (shimResult) {
+			return shimResult;
+		}
 	}
 
 	// 2) Fall back to libnut. If the image looks empty, treat as failure.
 	try {
 		const jimpImg = imageToJimp(await screen.grab());
-		if (!(await isLikelyEmpty(jimpImg))) return jimpImg;
-	} catch { /* fall through */ }
+		if (!(await isLikelyEmpty(jimpImg))) {
+			return jimpImg;
+		}
+	} catch {/* fall through */}
 
 	// 3) Last resort: shim again, accept whatever it returns.
 	try {
 		execFileSync('screencapture', ['-x', tmpPath], {stdio: 'ignore'});
 		return await readTmpAsJimp();
 	} finally {
-		try { unlinkSync(tmpPath); } catch { /* ignore */ }
+		try {
+			unlinkSync(tmpPath);
+		} catch {/* ignore */}
 	}
 }
 
@@ -151,8 +172,8 @@ function xdotoolType(text: string): void {
 // image. Limits below are set high enough that typical desktop setups
 // (up to 4K-wide and 16MP total) pass through untouched. Only extreme
 // configurations trigger a downsample.
-const maxLongEdge = 4096;             // 4K on the long edge
-const maxPixels = 16 * 1024 * 1024;   // 16 megapixels
+const maxLongEdge = 4096; // 4K on the long edge
+const maxPixels = 16 * 1024 * 1024; // 16 megapixels
 
 /**
  * Calculate the scale factor to downsample an image to fit API limits.
@@ -191,6 +212,7 @@ const ActionEnum = z.enum([
 	'double_click',
 	'scroll',
 	'get_screenshot',
+	'get_focused_screenshot',
 	'get_cursor_position',
 ]);
 
@@ -198,14 +220,15 @@ const actionDescription = `The action to perform. The available actions are:
 * key: Press a key or key-combination on the keyboard.
 * type: Type a string of text on the keyboard.
 * get_cursor_position: Get the current (x, y) pixel coordinate of the cursor on the screen.
-* mouse_move: Move the cursor to a specified (x, y) pixel coordinate on the screen.
+* mouse_move: Move the cursor to a specified (x, y) pixel coordinate on the screen. For a dedicated top-level tool that just moves the mouse (no other action mixed in), use the separate "move_mouse" tool.
 * left_click: Click the left mouse button. If coordinate is provided, moves to that position first.
 * left_click_drag: Click and drag the cursor to a specified (x, y) pixel coordinate on the screen.
 * right_click: Click the right mouse button. If coordinate is provided, moves to that position first.
 * middle_click: Click the middle mouse button. If coordinate is provided, moves to that position first.
 * double_click: Double-click the left mouse button. If coordinate is provided, moves to that position first.
 * scroll: Scroll the screen in a specified direction. Requires coordinate (moves there first) and text parameter with direction: "up", "down", "left", or "right". Optionally append ":N" to scroll N pixels (default 300), e.g. "down:500".
-* get_screenshot: Take a screenshot of the screen.`;
+* get_screenshot: Take a screenshot of the full screen. Prefer get_focused_screenshot for the second step of the multi-step aiming workflow (see below) to avoid re-sending the whole desktop.
+* get_focused_screenshot: Crop a region of the screen around an approximate coordinate and return just that crop, with metadata describing the crop's position in the full screen. Use this for precise clicking — see "Multi-step aiming (precision targeting)" in the tool description.`;
 
 const toolDescription = `Use a mouse and keyboard to interact with a computer, and take screenshots.
 * This is an interface to a desktop GUI. You do not have access to a terminal or applications menu. You must click on desktop icons to start applications.
@@ -222,12 +245,31 @@ Window focus:
 Using the crosshair:
 * Screenshots show a red crosshair at the current cursor position.
 * After clicking, check where the crosshair appears vs your target. If it missed, adjust coordinates proportionally to the distance - start with large adjustments and refine. Avoid small incremental changes when the crosshair is far from the target (distances are often further than you expect).
-* Consider display dimensions when estimating positions. E.g. if it's 90% to the bottom of the screen, the coordinates should reflect this.`;
+* Consider display dimensions when estimating positions. E.g. if it's 90% to the bottom of the screen, the coordinates should reflect this.
+
+Multi-step aiming (precision targeting):
+* On a large desktop (e.g. 1920x2160 dual-stacked, or 4K) the model only has limited "visual attention" to spend on a full screenshot, so a single direct click on a small button is unreliable.
+* Default workflow for precise clicking (and to avoid re-sending the whole desktop multiple times):
+  1. action=get_screenshot — identify the rough region of the target element.
+  2. action=get_focused_screenshot coordinate=[X, Y] size=400 (or 600, or [w, h]) — receive a small crop of the screen around (X, Y), plus metadata describing the crop's position in the full screen.
+  3. In the crop, locate the exact target. Compute the click coordinates for the full screen:
+     full_x = crop_x_min + local_x_in_crop * (crop_width / image_width)
+     full_y = crop_y_min + local_y_in_crop * (crop_height / image_height)
+     (For typical 400x400 or 600x600 crops, the returned image equals the crop in API-image space, so this simplifies to: full = crop_min + local.)
+  4. Optionally use the separate "move_mouse" tool to move the cursor (no click) to verify / hover.
+  5. action=left_click coordinate=[full_x, full_y] — click.
+  6. If you need to verify a result, prefer a *focused* follow-up screenshot (action=get_focused_screenshot around the affected area) over a full-screen screenshot.
+* Coordinates throughout (in get_screenshot, get_focused_screenshot, click, move_mouse) are in the same API image space — the space the model sees in the returned image.`;
 
 const coordinateSchema = z
 	.array(z.number())
 	.length(2)
 	.describe('(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates');
+
+const sizeSchema = z
+	.union([z.number().int().positive(), z.array(z.number().int().positive()).length(2)])
+	.optional()
+	.describe('Crop size in API image pixels, for get_focused_screenshot. A single number N means an NxN square crop. A 2-element array [w, h] means a rectangular crop. Default: 400 (400x400).');
 
 export function registerComputer(server: McpServer): void {
 	server.registerTool(
@@ -239,6 +281,7 @@ export function registerComputer(server: McpServer): void {
 				action: ActionEnum.describe(actionDescription),
 				coordinate: coordinateSchema.optional(),
 				text: z.string().optional().describe('Text to type or key command to execute'),
+				size: sizeSchema,
 			}).strict(),
 			// Note: No outputSchema because this tool returns varying content types including images
 			annotations: {
@@ -246,7 +289,12 @@ export function registerComputer(server: McpServer): void {
 			},
 		},
 		async (args) => {
-			const {action, coordinate, text} = args as {action: z.infer<typeof ActionEnum>; coordinate?: [number, number]; text?: string};
+			const {action, coordinate, text, size} = args as {
+				action: z.infer<typeof ActionEnum>;
+				coordinate?: [number, number];
+				text?: string;
+				size?: number | [number, number];
+			};
 
 			// Scale coordinates from API image space to logical screen space
 			let scaledCoordinate = coordinate;
@@ -429,73 +477,172 @@ export function registerComputer(server: McpServer): void {
 					const cursorInImageX = Math.floor(cursorPos.x / scale);
 					const cursorInImageY = Math.floor(cursorPos.y / scale);
 
-					// Draw a crosshair at cursor position (red color)
-					const crosshairSize = 20;
-					const crosshairColor = 0xFF0000FF; // Red with full opacity (RGBA)
-					const imageWidth = image.getWidth();
-					const imageHeight = image.getHeight();
+					drawCrosshair(image, cursorInImageX, cursorInImageY);
 
-					// Draw horizontal line
-					for (let x = Math.max(0, cursorInImageX - crosshairSize); x <= Math.min(imageWidth - 1, cursorInImageX + crosshairSize); x++) {
-						if (cursorInImageY >= 0 && cursorInImageY < imageHeight) {
-							image.setPixelColor(crosshairColor, x, cursorInImageY);
-							// Make it thicker
-							if (cursorInImageY > 0) {
-								image.setPixelColor(crosshairColor, x, cursorInImageY - 1);
-							}
+					return encodeScreenshotResponse(image, {
+						image_width: image.getWidth(),
+						image_height: image.getHeight(),
+					});
+				}
 
-							if (cursorInImageY < imageHeight - 1) {
-								image.setPixelColor(crosshairColor, x, cursorInImageY + 1);
-							}
-						}
+				case 'get_focused_screenshot': {
+					if (!coordinate) {
+						throw new Error('Coordinate required for get_focused_screenshot (approximate center of the target element, in API image space).');
 					}
 
-					// Draw vertical line
-					for (let y = Math.max(0, cursorInImageY - crosshairSize); y <= Math.min(imageHeight - 1, cursorInImageY + crosshairSize); y++) {
-						if (cursorInImageX >= 0 && cursorInImageX < imageWidth) {
-							image.setPixelColor(crosshairColor, cursorInImageX, y);
-							// Make it thicker
-							if (cursorInImageX > 0) {
-								image.setPixelColor(crosshairColor, cursorInImageX - 1, y);
-							}
+					// Resolve size: single number -> square; array -> [w, h]. Default 400.
+					const requestedSize = size ?? 400;
+					const [requestedWidth, requestedHeight] = Array.isArray(requestedSize)
+						? requestedSize
+						: [requestedSize, requestedSize];
 
-							if (cursorInImageX < imageWidth - 1) {
-								image.setPixelColor(crosshairColor, cursorInImageX + 1, y);
-							}
-						}
+					// 1) Capture full screen at logical resolution.
+					const fullImage = await grabScreen();
+					const logicalWidth = fullImage.getWidth();
+					const logicalHeight = fullImage.getHeight();
+
+					// 2) Translate the (coordinate, size) from API image space to logical space.
+					const apiToLogical = await getApiToLogicalScale();
+					const logicalCenterX = coordinate[0] * apiToLogical;
+					const logicalCenterY = coordinate[1] * apiToLogical;
+					const logicalWidthReq = requestedWidth * apiToLogical;
+					const logicalHeightReq = requestedHeight * apiToLogical;
+
+					// 3) Compute crop rectangle, clamped to display bounds.
+					const {cropX, cropY, cropWidth, cropHeight} = computeCropRect({
+						logicalCenterX,
+						logicalCenterY,
+						logicalWidth: logicalWidthReq,
+						logicalHeight: logicalHeightReq,
+						screenLogicalWidth: logicalWidth,
+						screenLogicalHeight: logicalHeight,
+					});
+
+					// 4) Crop the image (jimp is in-place via the returned object).
+					const cropImage = fullImage.clone();
+					cropImage.crop(cropX, cropY, cropWidth, cropHeight);
+
+					// 5) Resize crop to fit API limits (400–600 typically needs no downsample).
+					const cropScaleFactor = getSizeToApiScale(cropImage.getWidth(), cropImage.getHeight());
+					if (cropScaleFactor < 1) {
+						cropImage.resize(
+							Math.floor(cropImage.getWidth() * cropScaleFactor),
+							Math.floor(cropImage.getHeight() * cropScaleFactor),
+						);
 					}
 
-					// Get PNG buffer from Jimp
-					const pngBuffer = await image.getBufferAsync('image/png');
+					// 6) Crosshair at the requested center, in API image space of the returned crop.
+					//    The center in API-image-of-full-screen is `coordinate`; convert to API-image-of-crop space.
+					const cropApiXMin = cropX / apiToLogical;
+					const cropApiYMin = cropY / apiToLogical;
+					const cropApiWidth = cropWidth / apiToLogical;
+					const cropApiHeight = cropHeight / apiToLogical;
+					const returnedImageWidth = cropImage.getWidth();
+					const returnedImageHeight = cropImage.getHeight();
+					const {x: inCropX, y: inCropY} = mapApiToCropImage(
+						coordinate[0],
+						coordinate[1],
+						cropApiXMin,
+						cropApiYMin,
+						cropApiWidth,
+						cropApiHeight,
+						returnedImageWidth,
+						returnedImageHeight,
+					);
+					drawCrosshair(cropImage, inCropX, inCropY);
 
-					// Compress PNG using sharp, to fit size limits
-					const optimizedBuffer = await sharp(pngBuffer)
-						.png({quality: 80, compressionLevel: 9})
-						.toBuffer();
+					// Full-screen API dimensions for the model to interpret crop offsets.
+					const fullApiWidth = logicalWidth / apiToLogical;
+					const fullApiHeight = logicalHeight / apiToLogical;
 
-					// Convert optimized buffer to base64
-					const base64Data = optimizedBuffer.toString('base64');
-
-					return {
-						content: [
-							{
-								type: 'text',
-								text: JSON.stringify({
-									// Report the image dimensions - Claude should use coordinates within this space
-									// These may differ from the actual display due to scaling for API limits
-									image_width: imageWidth,
-									image_height: imageHeight,
-								}),
-							},
-							{
-								type: 'image',
-								data: base64Data,
-								mimeType: 'image/png',
-							},
-						],
-					};
+					return encodeScreenshotResponse(cropImage, {
+						image_width: returnedImageWidth,
+						image_height: returnedImageHeight,
+						crop_x_min: Math.round(cropApiXMin),
+						crop_y_min: Math.round(cropApiYMin),
+						crop_width: Math.round(cropApiWidth),
+						crop_height: Math.round(cropApiHeight),
+						screen_width: Math.round(fullApiWidth),
+						screen_height: Math.round(fullApiHeight),
+					});
 				}
 			}
 		},
 	);
+}
+
+/**
+ * Draw a red crosshair at (cx, cy) on the given Jimp image. Out-of-bounds
+ * coordinates are clipped. Used by get_screenshot and get_focused_screenshot.
+ */
+function drawCrosshair(image: ReturnType<typeof imageToJimp>, cx: number, cy: number): void {
+	const crosshairSize = 20;
+	const crosshairColor = 0xFF0000FF; // Red with full opacity (RGBA)
+	const imageWidth = image.getWidth();
+	const imageHeight = image.getHeight();
+
+	// Draw horizontal line (with a 1px-thick centre, plus 1px above and below)
+	for (let x = Math.max(0, Math.floor(cx) - crosshairSize); x <= Math.min(imageWidth - 1, Math.floor(cx) + crosshairSize); x++) {
+		const yMid = Math.floor(cy);
+		if (yMid >= 0 && yMid < imageHeight) {
+			image.setPixelColor(crosshairColor, x, yMid);
+			if (yMid > 0) {
+				image.setPixelColor(crosshairColor, x, yMid - 1);
+			}
+
+			if (yMid < imageHeight - 1) {
+				image.setPixelColor(crosshairColor, x, yMid + 1);
+			}
+		}
+	}
+
+	// Draw vertical line
+	for (let y = Math.max(0, Math.floor(cy) - crosshairSize); y <= Math.min(imageHeight - 1, Math.floor(cy) + crosshairSize); y++) {
+		const xMid = Math.floor(cx);
+		if (xMid >= 0 && xMid < imageWidth) {
+			image.setPixelColor(crosshairColor, xMid, y);
+			if (xMid > 0) {
+				image.setPixelColor(crosshairColor, xMid - 1, y);
+			}
+
+			if (xMid < imageWidth - 1) {
+				image.setPixelColor(crosshairColor, xMid + 1, y);
+			}
+		}
+	}
+}
+
+/**
+ * Encode a Jimp image as PNG via sharp and return an MCP tool result with
+ * a JSON metadata text block + a base64 image block. Used by get_screenshot
+ * and get_focused_screenshot.
+ */
+async function encodeScreenshotResponse(
+	image: ReturnType<typeof imageToJimp>,
+	metadata: Record<string, number>,
+): Promise<{
+		content: (
+			| {type: 'text'; text: string}
+			| {type: 'image'; data: string; mimeType: string}
+		)[];
+	}> {
+	const pngBuffer = await image.getBufferAsync('image/png');
+	const optimizedBuffer = await sharp(pngBuffer)
+		.png({quality: 80, compressionLevel: 9})
+		.toBuffer();
+	const base64Data = optimizedBuffer.toString('base64');
+
+	return {
+		content: [
+			{
+				type: 'text',
+				text: JSON.stringify(metadata),
+			},
+			{
+				type: 'image',
+				data: base64Data,
+				mimeType: 'image/png',
+			},
+		],
+	};
 }

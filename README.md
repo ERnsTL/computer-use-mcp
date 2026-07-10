@@ -98,6 +98,22 @@ We implement a near identical computer use tool to [Anthropic's official compute
 
 This talks to your computer using [nut.js](https://github.com/nut-tree/nut.js)
 
+## Multi-step aiming (precision targeting)
+
+For precise clicking on a large desktop (e.g. 1920×2160 dual-stacked, 4K, etc.), the model only has limited "visual attention" to spend on a full screenshot, so a single direct click on a small button is unreliable. This server supports a two-step workflow that significantly improves click precision without changing the underlying vision model:
+
+1. `computer` action `get_screenshot` — identify the rough region of the target.
+2. `computer` action `get_focused_screenshot coordinate=[X, Y] size=400` (or `600`, or `[w, h]`) — request a small crop of the screen around the approximate target. The response includes the cropped image plus metadata describing the crop's position in the full screen (`crop_x_min`, `crop_y_min`, `crop_width`, `crop_height`, `screen_width`, `screen_height`).
+3. In the crop, locate the exact target. Compute the click coordinates for the full screen:
+   - `full_x = crop_x_min + local_x * (crop_width / image_width)`
+   - `full_y = crop_y_min + local_y * (crop_height / image_height)`
+   - (For typical 400×400 or 600×600 crops, the returned image matches the crop in API-image space, so this simplifies to: `full = crop_min + local`.)
+4. Optionally use the dedicated `move_mouse` top-level tool to move the cursor (no click) and verify / hover.
+5. `computer` action `left_click coordinate=[full_x, full_y]` — click.
+6. To verify a result, prefer a *focused* follow-up screenshot (`get_focused_screenshot` around the affected area) over a full-screen screenshot — this reduces both bandwidth and the model's wasted visual attention on unrelated parts of the desktop.
+
+The `move_mouse` top-level tool is a focused, single-purpose way to move the cursor without any other side effect. (The same effect is also available as `computer` action `mouse_move` for backward compatibility.)
+
 ## Contributing
 
 Pull requests are welcomed on GitHub! To get started:
