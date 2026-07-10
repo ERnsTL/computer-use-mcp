@@ -16,7 +16,8 @@ import Jimp from 'jimp';
 import sharp from 'sharp';
 import {toKeys} from '../utils/xdotoolStringToKeys.js';
 import {jsonResult} from '../utils/response.js';
-import {computeCropRect, mapApiToCropImage} from '../utils/cropGeometry.js';
+import {computeCropRect, mapApiToCropImage, mapCropImageToApi} from '../utils/cropGeometry.js';
+import {RegionRegistry, SCREEN_REGION, REGION_PREFIX, type RegionMeta} from '../utils/regions.js';
 
 /**
  * Grab the screen. Strategy:
@@ -200,6 +201,58 @@ async function getApiToLogicalScale(): Promise<number> {
 	return 1 / apiScaleFactor;
 }
 
+// Module-level region registry. Persists across tool calls within the same
+// server lifetime so the model can echo a region id from a prior screenshot
+// response. Reset on process restart.
+const regionRegistry = new RegionRegistry(100);
+
+/**
+ * Resolve a `region` + `coordinate` pair to full-screen API-image coordinates.
+ *
+ * - `region` omitted (or `"screen"`) → `coordinate` is already in full-screen
+ *   API image space; pass through.
+ * - `region` matches a stored region → `coordinate` is in that region's
+ *   local pixel space; translate to full-screen API image space.
+ * - Any other value → throw a structured error.
+ */
+export function resolveApiCoordinate(
+	region: string | undefined,
+	coordinate: [number, number],
+): {x: number; y: number; regionId: string} {
+	const regionId = region ?? SCREEN_REGION;
+
+	if (regionId === SCREEN_REGION) {
+		return {x: coordinate[0], y: coordinate[1], regionId: SCREEN_REGION};
+	}
+
+	if (!regionId.startsWith(REGION_PREFIX)) {
+		throw new Error(
+			`Invalid region "${regionId}". Use "${SCREEN_REGION}" for full-screen coordinates, or echo back a "region:<n>" id from a previous get_screenshot / get_focused_screenshot response.`,
+		);
+	}
+
+	const meta = regionRegistry.get(regionId);
+	if (!meta) {
+		throw new Error(
+			`Unknown region "${regionId}". Call get_screenshot or get_focused_screenshot first to obtain a valid region id.`,
+		);
+	}
+
+	return {
+		...mapCropImageToApi(
+			coordinate[0],
+			coordinate[1],
+			meta.cropApiXMin,
+			meta.cropApiYMin,
+			meta.cropApiWidth,
+			meta.cropApiHeight,
+			meta.returnedImageWidth,
+			meta.returnedImageHeight,
+		),
+		regionId,
+	};
+}
+
 // Define the action enum values
 const ActionEnum = z.enum([
 	'key',
@@ -228,7 +281,7 @@ const actionDescription = `The action to perform. The available actions are:
 * double_click: Double-click the left mouse button. If coordinate is provided, moves to that position first.
 * scroll: Scroll the screen in a specified direction. Requires coordinate (moves there first) and text parameter with direction: "up", "down", "left", or "right". Optionally append ":N" to scroll N pixels (default 300), e.g. "down:500".
 * get_screenshot: Take a screenshot of the full screen. Prefer get_focused_screenshot for the second step of the multi-step aiming workflow (see below) to avoid re-sending the whole desktop.
-* get_focused_screenshot: Crop a region of the screen around an approximate coordinate and return just that crop, with metadata describing the crop's position in the full screen. Use this for precise clicking — see "Multi-step aiming (precision targeting)" in the tool description.`;
+* get_focused_screenshot: Crop a region of the screen around an approximate coordinate and return just that crop, with metadata describing the crop's position in the full screen. The response carries a "region" id ("region:<n>") that you can echo back on a subsequent click/move/scroll action to address coordinates in the crop's local pixel space.`;
 
 const toolDescription = `Use a mouse and keyboard to interact with a computer, and take screenshots.
 * This is an interface to a desktop GUI. You do not have access to a terminal or applications menu. You must click on desktop icons to start applications.
@@ -250,21 +303,24 @@ Using the crosshair:
 Multi-step aiming (precision targeting):
 * On a large desktop (e.g. 1920x2160 dual-stacked, or 4K) the model only has limited "visual attention" to spend on a full screenshot, so a single direct click on a small button is unreliable.
 * Default workflow for precise clicking (and to avoid re-sending the whole desktop multiple times):
-  1. action=get_screenshot — identify the rough region of the target element. The response includes cursor_x / cursor_y so you know where the cursor is without re-reading the image.
-  2. action=get_focused_screenshot coordinate=[X, Y] size=400 (or 600, or [w, h]) — receive a small crop of the screen around (X, Y), plus metadata describing the crop's position in the full screen. The response also includes cursor_x / cursor_y (in full-screen API-image space) so you know the cursor location relative to the crop without another screenshot.
-  3. In the crop, locate the exact target. Compute the click coordinates for the full screen:
-     full_x = crop_x_min + local_x_in_crop * (crop_width / image_width)
-     full_y = crop_y_min + local_y_in_crop * (crop_height / image_height)
-     (For typical 400x400 or 600x600 crops, the returned image equals the crop in API-image space, so this simplifies to: full = crop_min + local.)
-  4. Optionally use the separate "move_mouse" tool to move the cursor (no click) to verify / hover.
-  5. action=left_click coordinate=[full_x, full_y] — click.
-  6. If you need to verify a result, prefer a *focused* follow-up screenshot (action=get_focused_screenshot around the affected area) over a full-screen screenshot — the response will include the new cursor position so you can confirm the click landed where you expected.
-* Coordinates throughout (in get_screenshot, get_focused_screenshot, click, move_mouse) are in the same API image space — the space the model sees in the returned image.`;
+  1. action=get_screenshot — identify the rough region of the target element. The response includes a "region" id ("screen") and the cursor_x / cursor_y so you know where the cursor is without re-reading the image.
+  2. action=get_focused_screenshot coordinate=[X, Y] size=400 (or 600, or [w, h]) — receive a small crop of the screen around (X, Y), plus metadata describing the crop's position in the full screen. The response carries a "region" id ("region:<n>") that you echo back to address coordinates in this crop.
+  3. In the crop, locate the exact target. Address it directly with the region id:
+     action=left_click region="region:<n>" coordinate=[local_x, local_y]
+     The server translates the local coordinates back to full-screen API coordinates for you — no arithmetic on your side.
+  4. Optionally use the separate "move_mouse" tool (with the same region / coordinate pattern) to move the cursor (no click) to verify / hover.
+  5. If you need to verify a result, prefer a *focused* follow-up screenshot (action=get_focused_screenshot around the affected area) over a full-screen screenshot — the response will include the new cursor position so you can confirm the click landed where you expected.
+* Coordinates throughout (in get_screenshot, get_focused_screenshot, click, move_mouse) are in the same API image space — the space the model sees in the returned image. Passing a region from a previous screenshot response switches coordinate interpretation to that region's local pixel space.`;
 
 const coordinateSchema = z
 	.array(z.number())
 	.length(2)
-	.describe('(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates');
+	.describe('(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates. In full-screen API image space if `region` is omitted or "screen"; in the named region\'s local pixel space otherwise.');
+
+const regionSchema = z
+	.string()
+	.optional()
+	.describe(`Opaque handle from a previous get_screenshot ("screen") or get_focused_screenshot ("region:<n>") response. Defaults to "screen" (full-screen API image space). When set, \`coordinate\` is interpreted in the named region's local pixel space and the server maps it back to full-screen API coordinates internally.`);
 
 const sizeSchema = z
 	.union([z.number().int().positive(), z.array(z.number().int().positive()).length(2)])
@@ -280,6 +336,7 @@ export function registerComputer(server: McpServer): void {
 			inputSchema: z.object({
 				action: ActionEnum.describe(actionDescription),
 				coordinate: coordinateSchema.optional(),
+				region: regionSchema,
 				text: z.string().optional().describe('Text to type or key command to execute'),
 				size: sizeSchema,
 			}).strict(),
@@ -289,20 +346,30 @@ export function registerComputer(server: McpServer): void {
 			},
 		},
 		async (args) => {
-			const {action, coordinate, text, size} = args as {
+			const {action, coordinate, region, text, size} = args as {
 				action: z.infer<typeof ActionEnum>;
 				coordinate?: [number, number];
+				region?: string;
 				text?: string;
 				size?: number | [number, number];
 			};
 
-			// Scale coordinates from API image space to logical screen space
-			let scaledCoordinate = coordinate;
+			// Resolve (region, coordinate) to full-screen API-image coordinates
+			// (or throw a structured error for unknown regions). For actions
+			// that need a coordinate, we resolve up front so the validation
+			// below works in a single, uniform coordinate space.
+			let apiCoordinate: {x: number; y: number; regionId: string} | null = null;
 			if (coordinate) {
+				apiCoordinate = resolveApiCoordinate(region, coordinate);
+			}
+
+			// Scale from API image space to logical screen space
+			let scaledCoordinate: [number, number] | undefined;
+			if (apiCoordinate) {
 				const scale = await getApiToLogicalScale();
 				scaledCoordinate = [
-					Math.round(coordinate[0] * scale),
-					Math.round(coordinate[1] * scale),
+					Math.round(apiCoordinate.x * scale),
+					Math.round(apiCoordinate.y * scale),
 				];
 
 				// Validate coordinates are within display bounds
@@ -480,6 +547,7 @@ export function registerComputer(server: McpServer): void {
 					drawCrosshair(image, cursorInImageX, cursorInImageY);
 
 					return encodeScreenshotResponse(image, {
+						region: SCREEN_REGION,
 						image_width: image.getWidth(),
 						image_height: image.getHeight(),
 						cursor_x: cursorInImageX,
@@ -491,6 +559,11 @@ export function registerComputer(server: McpServer): void {
 					if (!coordinate) {
 						throw new Error('Coordinate required for get_focused_screenshot (approximate center of the target element, in API image space).');
 					}
+
+					// Resolve up front so we can use apiCoordinate.x/y in the
+					// crop math (it might be a region-relative click target
+					// the model is about to point at).
+					const resolved = apiCoordinate as {x: number; y: number; regionId: string};
 
 					// Resolve size: single number -> square; array -> [w, h]. Default 400.
 					const requestedSize = size ?? 400;
@@ -505,8 +578,8 @@ export function registerComputer(server: McpServer): void {
 
 					// 2) Translate the (coordinate, size) from API image space to logical space.
 					const apiToLogical = await getApiToLogicalScale();
-					const logicalCenterX = coordinate[0] * apiToLogical;
-					const logicalCenterY = coordinate[1] * apiToLogical;
+					const logicalCenterX = resolved.x * apiToLogical;
+					const logicalCenterY = resolved.y * apiToLogical;
 					const logicalWidthReq = requestedWidth * apiToLogical;
 					const logicalHeightReq = requestedHeight * apiToLogical;
 
@@ -542,8 +615,8 @@ export function registerComputer(server: McpServer): void {
 					const returnedImageWidth = cropImage.getWidth();
 					const returnedImageHeight = cropImage.getHeight();
 					const {x: inCropX, y: inCropY} = mapApiToCropImage(
-						coordinate[0],
-						coordinate[1],
+						resolved.x,
+						resolved.y,
 						cropApiXMin,
 						cropApiYMin,
 						cropApiWidth,
@@ -563,7 +636,20 @@ export function registerComputer(server: McpServer): void {
 					const cursorApiX = Math.floor(cursorPos.x / apiToLogical);
 					const cursorApiY = Math.floor(cursorPos.y / apiToLogical);
 
+					// Allocate a region id for this crop so the model can echo it
+					// back on a subsequent click/move/scroll. The id is part of
+					// the response so the model does not have to guess it.
+					const regionId = regionRegistry.allocate({
+						cropApiXMin,
+						cropApiYMin,
+						cropApiWidth,
+						cropApiHeight,
+						returnedImageWidth,
+						returnedImageHeight,
+					} satisfies RegionMeta);
+
 					return encodeScreenshotResponse(cropImage, {
+						region: regionId,
 						image_width: returnedImageWidth,
 						image_height: returnedImageHeight,
 						crop_x_min: Math.round(cropApiXMin),
@@ -629,12 +715,12 @@ function drawCrosshair(image: ReturnType<typeof imageToJimp>, cx: number, cy: nu
  */
 async function encodeScreenshotResponse(
 	image: ReturnType<typeof imageToJimp>,
-	metadata: Record<string, number>,
+	metadata: Record<string, number | string>,
 ): Promise<{
-		content: (
-			| {type: 'text'; text: string}
-			| {type: 'image'; data: string; mimeType: string}
-		)[];
+	content: (
+		| {type: 'text'; text: string}
+		| {type: 'image'; data: string; mimeType: string}
+	)[];
 	}> {
 	const pngBuffer = await image.getBufferAsync('image/png');
 	const optimizedBuffer = await sharp(pngBuffer)

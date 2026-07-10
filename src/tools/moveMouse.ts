@@ -2,6 +2,7 @@ import type {McpServer} from '@modelcontextprotocol/sdk/server/mcp.js';
 import {z} from 'zod';
 import {mouse, Point, screen} from '@nut-tree-fork/nut-js';
 import {jsonResult} from '../utils/response.js';
+import {resolveApiCoordinate} from './computer.js';
 
 /**
  * Compute the scale factor from API image coordinates to logical screen
@@ -32,12 +33,17 @@ async function getApiToLogicalScale(): Promise<number> {
 const coordinateSchema = z
 	.array(z.number())
 	.length(2)
-	.describe('(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates in API image space (the same coordinate system the model sees in screenshots).');
+	.describe('(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates in API image space. In full-screen API image space if `region` is omitted or "screen"; in the named region\'s local pixel space otherwise.');
+
+const regionSchema = z
+	.string()
+	.optional()
+	.describe(`Opaque handle from a previous get_screenshot ("screen") or get_focused_screenshot ("region:<n>") response. Defaults to "screen".`);
 
 const toolDescription = `Move the mouse cursor to the specified coordinates on the screen, without clicking.
 * This is useful for hovering, positioning the cursor before a click, or verifying where the cursor currently is.
-* Prefer the multi-step aiming workflow: take a screenshot, request a focused crop around the rough region, locate the target precisely in the crop, then either move_mouse (to verify / hover) or left_click (to act).
-* Coordinates are in API image space (the same coordinate system used by screenshots and click actions).`;
+* Prefer the multi-step aiming workflow: take a screenshot, request a focused crop around the rough region, locate the target precisely in the crop, then either move_mouse (with the crop's "region" id, to verify / hover) or left_click (with the same "region" id, to act).
+* Coordinates are in API image space by default. Pass a "region" id from a prior screenshot response to address coordinates in that region's local pixel space — the server maps them back to full-screen for you.`;
 
 export function registerMoveMouse(server: McpServer): void {
 	server.registerTool(
@@ -46,19 +52,23 @@ export function registerMoveMouse(server: McpServer): void {
 			title: 'Move Mouse',
 			description: toolDescription,
 			inputSchema: z.object({
-				coordinate: coordinateSchema.describe('Target (x, y) coordinates in API image space.'),
+				coordinate: coordinateSchema.describe('Target (x, y) coordinates. In full-screen API image space if `region` is omitted or "screen"; in the named region\'s local pixel space otherwise.'),
+				region: regionSchema,
 			}).strict(),
 			annotations: {
 				readOnlyHint: false,
 			},
 		},
 		async (args) => {
-			const {coordinate} = args as {coordinate: [number, number]};
+			const {coordinate, region} = args as {coordinate: [number, number]; region?: string};
+
+			// Resolve to full-screen API-image coordinates (throws on unknown region).
+			const resolved = resolveApiCoordinate(region, coordinate);
 
 			// Scale from API image space to logical screen space.
 			const scale = await getApiToLogicalScale();
-			const logicalX = Math.round(coordinate[0] * scale);
-			const logicalY = Math.round(coordinate[1] * scale);
+			const logicalX = Math.round(resolved.x * scale);
+			const logicalY = Math.round(resolved.y * scale);
 
 			// Validate coordinates are within display bounds.
 			const width = await screen.width();
@@ -74,6 +84,7 @@ export function registerMoveMouse(server: McpServer): void {
 			const newPos = await mouse.getPosition();
 			return jsonResult({
 				ok: true,
+				region: resolved.regionId,
 				x: Math.round(newPos.x / scale),
 				y: Math.round(newPos.y / scale),
 			});
