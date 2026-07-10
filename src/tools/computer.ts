@@ -3,7 +3,7 @@ import {z} from 'zod';
 import {
 	mouse,
 	keyboard,
-	Point,
+	Point as NutPoint,
 	screen,
 	Button,
 	imageToJimp,
@@ -16,7 +16,13 @@ import Jimp from 'jimp';
 import sharp from 'sharp';
 import {toKeys} from '../utils/xdotoolStringToKeys.js';
 import {jsonResult} from '../utils/response.js';
-import {computeCropRect, mapApiToCropImage, mapCropImageToApi} from '../utils/cropGeometry.js';
+import {
+	computeCropGeometry,
+	mapApiToCropImage,
+	mapCropImageToApi,
+	type Point,
+	type SizeInput,
+} from '../utils/cropGeometry.js';
 import {RegionRegistry, SCREEN_REGION, REGION_PREFIX, type RegionMeta} from '../utils/regions.js';
 
 /**
@@ -242,12 +248,12 @@ export function resolveApiCoordinate(
 		...mapCropImageToApi(
 			coordinate[0],
 			coordinate[1],
-			meta.cropApiXMin,
-			meta.cropApiYMin,
-			meta.cropApiWidth,
-			meta.cropApiHeight,
-			meta.returnedImageWidth,
-			meta.returnedImageHeight,
+			meta.cropRect.x,
+			meta.cropRect.y,
+			meta.cropRect.width,
+			meta.cropRect.height,
+			meta.returnedImageSize.width,
+			meta.returnedImageSize.height,
 		),
 		regionId,
 	};
@@ -284,23 +290,21 @@ function requireStoredRegion(region: string | undefined): RegionMeta & {regionId
 }
 
 /**
- * Capture the screen, crop to the given API-image rectangle, resize to fit
- * API size limits, draw a crosshair at the given API-image coordinate, allocate
+ * Capture the screen, compute the on-screen crop via `computeCropGeometry`
+ * (the single source of truth for region geometry), crop the image at the
+ * computed location, resize to fit API size limits, draw a crosshair, allocate
  * a fresh region id, and return the encoded MCP response.
  *
- * The crop rect is re-clamped against the current screen via `computeCropRect`
- * so a region that was captured on a larger screen still produces a valid
- * (possibly smaller) crop on a smaller one. The freshly-allocated region id
- * is the only handle the model should echo back; the original parent region
- * is left untouched and may continue to be used until it is FIFO-evicted.
+ * The crop is computed in API-image space from the requested center + size,
+ * with a SHIFT-NOT-SHRINK policy: the returned size equals the requested size
+ * whenever it fits the screen. This guarantees that the RegionRegistry
+ * metadata, the response, the crosshair, and the actual cropped image all
+ * describe the same rectangle — no second source of truth.
  */
 async function captureRegionAndEncode(params: {
-	cropApiXMin: number;
-	cropApiYMin: number;
-	cropApiWidth: number;
-	cropApiHeight: number;
-	crosshairApiX: number;
-	crosshairApiY: number;
+	requestedCenter: Point;
+	requestedSize: SizeInput;
+	parentRegion?: string;
 }): Promise<{
 	content: (
 		| {type: 'text'; text: string}
@@ -312,26 +316,27 @@ async function captureRegionAndEncode(params: {
 	const screenLogicalWidth = fullImage.getWidth();
 	const screenLogicalHeight = fullImage.getHeight();
 
-	// 2) Translate the (crop, crosshair) from API image space to logical space
-	//    and re-clamp via computeCropRect (so a region captured on a larger
-	//    screen stays in-bounds on a smaller one).
+	// 2) SINGLE CALCULATION: API -> logical -> API, with shift-not-shrink.
 	const apiToLogical = await getApiToLogicalScale();
-	const logicalCenterX = (params.cropApiXMin + params.cropApiWidth / 2) * apiToLogical;
-	const logicalCenterY = (params.cropApiYMin + params.cropApiHeight / 2) * apiToLogical;
-	const requestedLogicalWidth = params.cropApiWidth * apiToLogical;
-	const requestedLogicalHeight = params.cropApiHeight * apiToLogical;
-	const {cropX, cropY, cropWidth, cropHeight} = computeCropRect({
-		logicalCenterX,
-		logicalCenterY,
-		logicalWidth: requestedLogicalWidth,
-		logicalHeight: requestedLogicalHeight,
+	const apiScale = 1 / apiToLogical;
+	const geom = computeCropGeometry({
+		requestedCenter: params.requestedCenter,
+		requestedSize: params.requestedSize,
 		screenLogicalWidth,
 		screenLogicalHeight,
+		apiScale,
 	});
 
-	// 3) Crop the image (jimp is in-place via the returned object).
+	// 3) Crop the image (jimp is in-place via the returned object) at the
+	//    computed logical rect. Jimp rounds internally; this is one of the
+	//    very few places rounding happens.
 	const cropImage = fullImage.clone();
-	cropImage.crop(cropX, cropY, cropWidth, cropHeight);
+	cropImage.crop(
+		geom.logical.cropRect.x,
+		geom.logical.cropRect.y,
+		geom.logical.cropRect.width,
+		geom.logical.cropRect.height,
+	);
 
 	// 4) Resize crop to fit API limits (400–600 typically needs no downsample).
 	const cropScaleFactor = getSizeToApiScale(cropImage.getWidth(), cropImage.getHeight());
@@ -342,47 +347,55 @@ async function captureRegionAndEncode(params: {
 		);
 	}
 
-	// 5) Crosshair at the requested center, in returned-image space.
+	// 5) Crosshair at geom.crosshair (always inside the actual crop). The
+	//    crosshair is computed from the SAME geom object the registry will
+	//    receive, so it is guaranteed to be inside the stored cropRect.
 	const returnedImageWidth = cropImage.getWidth();
 	const returnedImageHeight = cropImage.getHeight();
 	const {x: inCropX, y: inCropY} = mapApiToCropImage(
-		params.crosshairApiX,
-		params.crosshairApiY,
-		params.cropApiXMin,
-		params.cropApiYMin,
-		params.cropApiWidth,
-		params.cropApiHeight,
+		geom.crosshair.x,
+		geom.crosshair.y,
+		geom.api.cropRect.x,
+		geom.api.cropRect.y,
+		geom.api.cropRect.width,
+		geom.api.cropRect.height,
 		returnedImageWidth,
 		returnedImageHeight,
 	);
 	drawCrosshair(cropImage, inCropX, inCropY);
 
 	// 6) Full-screen API dimensions + current cursor in full-screen API space.
-	const fullApiWidth = screenLogicalWidth / apiToLogical;
-	const fullApiHeight = screenLogicalHeight / apiToLogical;
+	const fullApiWidth = screenLogicalWidth * apiScale;
+	const fullApiHeight = screenLogicalHeight * apiScale;
 	const cursorPos = await mouse.getPosition();
 	const cursorApiX = Math.floor(cursorPos.x / apiToLogical);
 	const cursorApiY = Math.floor(cursorPos.y / apiToLogical);
 
-	// 7) Allocate a fresh region id. FIFO eviction still applies; the parent
-	//    region (if any) is left in place and may be used until it ages out.
-	const regionId = regionRegistry.allocate({
-		cropApiXMin: params.cropApiXMin,
-		cropApiYMin: params.cropApiYMin,
-		cropApiWidth: params.cropApiWidth,
-		cropApiHeight: params.cropApiHeight,
-		returnedImageWidth,
-		returnedImageHeight,
-	} satisfies RegionMeta);
+	// 7) Allocate a fresh region id with the FULL geometry context from geom.
+	//    This is the single source of truth for the region — every consumer
+	//    (response metadata, click translation, refresh, focus, …) reads from
+	//    these stored values. No second calculation anywhere.
+	const regionId = regionRegistry.allocate(
+		{
+			requestedCenter: geom.requestedCenter,
+			requestedSize: {width: geom.api.cropRect.width, height: geom.api.cropRect.height},
+			actualCenter: geom.actualCenter,
+			cropRect: geom.api.cropRect,
+			returnedImageSize: {width: returnedImageWidth, height: returnedImageHeight},
+		},
+		params.parentRegion,
+	);
 
+	// 8) Encode response with the SAME cropRect (rounded to integers at the
+	//    very last step, as per the "round only at the edges" discipline).
 	return encodeScreenshotResponse(cropImage, {
 		region: regionId,
 		image_width: returnedImageWidth,
 		image_height: returnedImageHeight,
-		crop_x_min: Math.round(params.cropApiXMin),
-		crop_y_min: Math.round(params.cropApiYMin),
-		crop_width: Math.round(params.cropApiWidth),
-		crop_height: Math.round(params.cropApiHeight),
+		crop_x_min: Math.round(geom.api.cropRect.x),
+		crop_y_min: Math.round(geom.api.cropRect.y),
+		crop_width: Math.round(geom.api.cropRect.width),
+		crop_height: Math.round(geom.api.cropRect.height),
 		screen_width: Math.round(fullApiWidth),
 		screen_height: Math.round(fullApiHeight),
 		cursor_x: cursorApiX,
@@ -567,13 +580,13 @@ export function registerComputer(server: McpServer): void {
 						throw new Error('Coordinate required for mouse_move');
 					}
 
-					await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
+					await mouse.setPosition(new NutPoint(scaledCoordinate[0], scaledCoordinate[1]));
 					return jsonResult({ok: true});
 				}
 
 				case 'left_click': {
 					if (scaledCoordinate) {
-						await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
+						await mouse.setPosition(new NutPoint(scaledCoordinate[0], scaledCoordinate[1]));
 					}
 
 					await mouse.leftClick();
@@ -586,14 +599,14 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					await mouse.pressButton(Button.LEFT);
-					await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
+					await mouse.setPosition(new NutPoint(scaledCoordinate[0], scaledCoordinate[1]));
 					await mouse.releaseButton(Button.LEFT);
 					return jsonResult({ok: true});
 				}
 
 				case 'right_click': {
 					if (scaledCoordinate) {
-						await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
+						await mouse.setPosition(new NutPoint(scaledCoordinate[0], scaledCoordinate[1]));
 					}
 
 					await mouse.rightClick();
@@ -602,7 +615,7 @@ export function registerComputer(server: McpServer): void {
 
 				case 'middle_click': {
 					if (scaledCoordinate) {
-						await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
+						await mouse.setPosition(new NutPoint(scaledCoordinate[0], scaledCoordinate[1]));
 					}
 
 					await mouse.click(Button.MIDDLE);
@@ -611,7 +624,7 @@ export function registerComputer(server: McpServer): void {
 
 				case 'double_click': {
 					if (scaledCoordinate) {
-						await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
+						await mouse.setPosition(new NutPoint(scaledCoordinate[0], scaledCoordinate[1]));
 					}
 
 					await mouse.doubleClick(Button.LEFT);
@@ -642,7 +655,7 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					// Move to position first
-					await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
+					await mouse.setPosition(new NutPoint(scaledCoordinate[0], scaledCoordinate[1]));
 
 					// Scroll in the specified direction
 					switch (direction.toLowerCase()) {
@@ -708,28 +721,9 @@ export function registerComputer(server: McpServer): void {
 					// the model is about to point at).
 					const resolved = apiCoordinate as {x: number; y: number; regionId: string};
 
-					// Resolve size: single number -> square; array -> [w, h]. Default 400.
-					const requestedSize = size ?? 400;
-					const [requestedWidth, requestedHeight] = Array.isArray(requestedSize)
-						? requestedSize
-						: [requestedSize, requestedSize];
-
-					// Translate (coordinate, size) to an API-image crop rect and
-					// let captureRegionAndEncode do the crop / resize / crosshair /
-					// region-allocate / encode dance. The crosshair is the
-					// requested center.
-					const cropApiWidth = requestedWidth;
-					const cropApiHeight = requestedHeight;
-					const cropApiXMin = resolved.x - cropApiWidth / 2;
-					const cropApiYMin = resolved.y - cropApiHeight / 2;
-
 					return captureRegionAndEncode({
-						cropApiXMin,
-						cropApiYMin,
-						cropApiWidth,
-						cropApiHeight,
-						crosshairApiX: resolved.x,
-						crosshairApiY: resolved.y,
+						requestedCenter: {x: resolved.x, y: resolved.y},
+						requestedSize: size ?? 400,
 					});
 				}
 
@@ -738,17 +732,12 @@ export function registerComputer(server: McpServer): void {
 					// not "screen"). Throws a structured error otherwise.
 					const parent = requireStoredRegion(region);
 
-					// Re-capture the same API-image crop with the crosshair at the
-					// crop's center. A new region id is allocated inside the helper.
-					const centerApiX = parent.cropApiXMin + parent.cropApiWidth / 2;
-					const centerApiY = parent.cropApiYMin + parent.cropApiHeight / 2;
+					// Re-derive from the parent's ACTUAL center and size — no
+					// drift, no re-derivation from the original request.
 					return captureRegionAndEncode({
-						cropApiXMin: parent.cropApiXMin,
-						cropApiYMin: parent.cropApiYMin,
-						cropApiWidth: parent.cropApiWidth,
-						cropApiHeight: parent.cropApiHeight,
-						crosshairApiX: centerApiX,
-						crosshairApiY: centerApiY,
+						requestedCenter: parent.actualCenter,
+						requestedSize: [parent.cropRect.width, parent.cropRect.height],
+						parentRegion: parent.regionId,
 					});
 				}
 
@@ -756,39 +745,20 @@ export function registerComputer(server: McpServer): void {
 					// Same validation as refresh_region.
 					const parent = requireStoredRegion(region);
 
-					// Default size: half the parent region's smaller API-image
-					// side (so a 400x400 parent produces a 200x200 child by
-					// default — the natural "zoom in one more level" step).
-					// If `size` is supplied, use it directly (single number ->
-					// square; [w, h] -> rectangle), so the model can also
-					// zoom out or pick a non-square crop.
-					let cropApiWidth: number;
-					let cropApiHeight: number;
-					if (size === undefined) {
-						const half = Math.max(1, Math.round(Math.min(parent.cropApiWidth, parent.cropApiHeight) / 2));
-						cropApiWidth = half;
-						cropApiHeight = half;
-					} else if (Array.isArray(size)) {
-						[cropApiWidth, cropApiHeight] = size;
-					} else {
-						cropApiWidth = size;
-						cropApiHeight = size;
-					}
+					// Default size: half the parent region's smaller side
+					// (so a 400x400 parent produces a 200x200 child by default
+					// — the natural "zoom in one more level" step). If `size`
+					// is supplied, pass it through unchanged (single number ->
+					// square; [w, h] -> rectangle).
+					const defaultSize: number = Math.max(1, Math.round(Math.min(parent.cropRect.width, parent.cropRect.height) / 2));
+					const requestedSize: SizeInput = size ?? defaultSize;
 
-					// Center the new crop on the parent region's center; the
+					// Center the new crop on the parent's ACTUAL center; the
 					// model does not need to re-derive it.
-					const centerApiX = parent.cropApiXMin + parent.cropApiWidth / 2;
-					const centerApiY = parent.cropApiYMin + parent.cropApiHeight / 2;
-					const cropApiXMin = centerApiX - cropApiWidth / 2;
-					const cropApiYMin = centerApiY - cropApiHeight / 2;
-
 					return captureRegionAndEncode({
-						cropApiXMin,
-						cropApiYMin,
-						cropApiWidth,
-						cropApiHeight,
-						crosshairApiX: centerApiX,
-						crosshairApiY: centerApiY,
+						requestedCenter: parent.actualCenter,
+						requestedSize,
+						parentRegion: parent.regionId,
 					});
 				}
 			}

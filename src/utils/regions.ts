@@ -13,22 +13,41 @@
  * pure FIFO keeps the data structure trivial to test.
  */
 
+import type {Point, Rect, Size} from './cropGeometry.js';
+
 export const SCREEN_REGION = 'screen';
 export const REGION_PREFIX = 'region:';
 
+/**
+ * The complete geometry context of a region. This is the single source
+ * of truth for "what does this region represent?" — the actual crop
+ * rect, the requested center and size, the actual center (which may
+ * differ from the requested one if the crop was shifted), the size of
+ * the returned image, and the parent region (if any).
+ *
+ * All values are stored as the internal normalized types (`Point`,
+ * `Rect`, `Size`). Public-API union types (`number | [w, h]`) are
+ * converted to `Size` at the boundary by `computeCropGeometry` /
+ * `captureRegionAndEncode` before the metadata is allocated.
+ */
 export type RegionMeta = {
-	/** Top-left x of the crop, in full-screen API-image pixels. */
-	cropApiXMin: number;
-	/** Top-left y of the crop, in full-screen API-image pixels. */
-	cropApiYMin: number;
-	/** Crop width in full-screen API-image pixels. */
-	cropApiWidth: number;
-	/** Crop height in full-screen API-image pixels. */
-	cropApiHeight: number;
-	/** Width of the image actually returned to the model. */
-	returnedImageWidth: number;
-	/** Height of the image actually returned to the model. */
-	returnedImageHeight: number;
+	/** What the caller asked for. By value, NOT a reference. */
+	requestedCenter: Point;
+	/** The size that was actually used for the crop (after shift-not-shrink). */
+	requestedSize: Size;
+	/** The actual center of the (possibly shifted) crop. */
+	actualCenter: Point;
+	/** The actual crop in full-screen API-image pixels. */
+	cropRect: Rect;
+	/** The size of the image actually returned to the model. */
+	returnedImageSize: Size;
+	/**
+	 * The region this region was derived from (e.g. the parent of
+	 * `refresh_region` or `focus_region`). Undefined for regions created
+	 * directly by `get_screenshot` / `get_focused_screenshot`.
+	 * Region ids are FIFO-evicted; treat this as advisory.
+	 */
+	parentRegion?: string;
 };
 
 export class RegionRegistry {
@@ -40,10 +59,17 @@ export class RegionRegistry {
 	/**
 	 * Allocate a new region id, store the metadata under it, and return
 	 * the id (e.g. `"region:7"`). Evicts the oldest entry on overflow.
+	 *
+	 * @param meta          The full geometry context.
+	 * @param parentRegion  Optional id of the parent region (for `refresh_region`,
+	 *                      `focus_region`, and any future derived-region operation).
 	 */
-	allocate(meta: RegionMeta): string {
+	allocate(meta: RegionMeta, parentRegion?: string): string {
 		const id = `${REGION_PREFIX}${this.nextId++}`;
-		this.store.set(id, meta);
+		// Conditionally spread parentRegion so we never set the key to undefined
+		// (under exactOptionalPropertyTypes, an explicit `undefined` is not the
+		// same as "absent").
+		this.store.set(id, parentRegion === undefined ? {...meta} : {...meta, parentRegion});
 		while (this.store.size > this.maxEntries) {
 			const oldest = this.store.keys().next().value;
 			if (oldest === undefined) {
