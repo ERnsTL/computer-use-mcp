@@ -118,3 +118,9 @@ dist
 build/
 dist/
 computer-use-mcp.dxt
+
+# local helper scripts
+*.sh
+
+# temporary files
+tmp/
